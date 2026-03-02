@@ -346,10 +346,12 @@ class TTSEngine:
                 log(f"[TTS] error: {e}")
 
     def _is_sexy(self, text: str) -> bool:
+        # Disabled by default. Set RITSU_TTS_SEXY=1 to enable.
+        if not _env_bool("RITSU_TTS_SEXY", False):
+            return False
         t = text.strip()
-        if not t or len(t) > 20: return False
-        # Only very short sweet phrases
-        if any(w in t for w in self.SEXY_WORDS) and len(t) <= 15:
+        if not t or len(t) > 15: return False
+        if any(w in t for w in self.SEXY_WORDS):
             return True
         return False
 
