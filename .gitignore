@@ -4,6 +4,7 @@
 ritsu_token.txt
 openai_key.txt
 ritsu_url.txt
+.ritsu_worker.env
 
 # === Python ===
 __pycache__/
@@ -46,11 +47,13 @@ q.txt
 ritsu_in.txt
 ritsu_out.txt
 emotion_tag.txt
+nul
 
 # === OS ===
 Thumbs.db
 .DS_Store
 
-# === IDE ===
+# === IDE / Tools ===
 .vscode/
 .idea/
+.claude/

@@ -1,0 +1,17 @@
+﻿import time, argparse
+from pythonosc.udp_client import SimpleUDPClient
+p=argparse.ArgumentParser()
+p.add_argument("--host", default="127.0.0.1")
+p.add_argument("--port", type=int, default=39539)
+p.add_argument("--name", default="Joy")
+p.add_argument("--value", type=float, default=1.0)
+p.add_argument("--hold", type=float, default=1.5)
+a=p.parse_args()
+c=SimpleUDPClient(a.host, a.port)
+c.send_message("/VMC/Ext/OK", 1)
+c.send_message("/VMC/Ext/Blend/Val", [a.name, float(a.value)])
+c.send_message("/VMC/Ext/Blend/Apply", [])
+time.sleep(a.hold)
+c.send_message("/VMC/Ext/Blend/Val", [a.name, 0.0])
+c.send_message("/VMC/Ext/Blend/Apply", [])
+print("sent", a.name, a.value, "to", a.host, a.port)
