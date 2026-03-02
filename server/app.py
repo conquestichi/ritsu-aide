@@ -14,6 +14,16 @@ from prometheus_client import CollectorRegistry, Counter, generate_latest, CONTE
 # OpenAI (Responses API)
 from openai import OpenAI
 
+# Long-term memory
+try:
+    import ritsu_memory as mem
+    MEMORY_ENABLED = True
+    print("[BOOT] ritsu_memory loaded")
+except Exception as _mem_err:
+    mem = None  # type: ignore
+    MEMORY_ENABLED = False
+    print(f"[WARN] ritsu_memory not loaded: {_mem_err}")
+
 APP_NAME = "ritsu"
 
 STATE_DIR = Path(os.getenv("RITSU_STATE_DIR", "/srv/ritsu/state"))
@@ -106,6 +116,14 @@ try:
         print("[WARN] worker_actions loaded but no router/register found")
 except Exception as e:
     print(f"[WARN] worker_actions import failed: {e}")
+
+# --- memory routes (/memory/knowledge, /memory/summaries, etc.) ---
+if MEMORY_ENABLED and mem is not None:
+    try:
+        app.include_router(mem.memory_router)
+        print("[BOOT] memory_router included")
+    except Exception as e:
+        print(f"[WARN] memory_router failed: {e}")
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -275,7 +293,7 @@ def db_add_turn(conversation_id: str, role: str, content: str) -> None:
 
 
 # ---- Prompt builder ----
-def build_instructions(memory: Dict[str, Any]) -> str:
+def build_instructions(memory: Dict[str, Any], conversation_id: str = "") -> str:
     persona = memory.get("persona", {}) if isinstance(memory.get("persona", {}), dict) else {}
     name = persona.get("name", "律")
     role = persona.get("role", "常駐秘書（司令官の実行補助）")
@@ -299,7 +317,7 @@ def build_instructions(memory: Dict[str, Any]) -> str:
             + json.dumps(micro, ensure_ascii=False)
         )
 
-    return (
+    base = (
         f"あなたは {name}。役割は {role}。\n"
         f"ユーザーの呼び名は「{call_user}」。\n"
         f"話し方: {tone}\n\n"
@@ -310,6 +328,17 @@ def build_instructions(memory: Dict[str, Any]) -> str:
         "JSON以外の文字、前置き、装飾、コードブロック、追加キーは禁止。\n"
         f"{micro_blob}"
     )
+
+    # 長期記憶の注入
+    if MEMORY_ENABLED and mem is not None and conversation_id:
+        try:
+            mem_ctx = mem.build_memory_context(conversation_id)
+            if mem_ctx:
+                base += mem_ctx
+        except Exception as e:
+            print(f"[WARN] memory context failed: {e}")
+
+    return base
 
 
 # ---- Routes ----
@@ -336,8 +365,16 @@ def metrics():
 def assistant_text(payload: AssistantTextIn):
     REQ_TOTAL.labels("/assistant/text", "200").inc()
 
+    # 記憶コマンド検出（"覚えて"/"忘れて"/"記憶一覧"）
+    if MEMORY_ENABLED and mem is not None:
+        cmd = mem.detect_memory_command(payload.text)
+        if cmd:
+            reply = mem.handle_memory_command(cmd)
+            if reply:
+                return AssistantTextOut(reply_text=reply, emotion_tag="calm")
+
     memory = load_memory()
-    instructions = build_instructions(memory)
+    instructions = build_instructions(memory, conversation_id=payload.conversation_id)
 
     # short stack
     history = db_get_recent_turns(payload.conversation_id, limit=MAX_TURNS * 2)
@@ -363,6 +400,13 @@ def assistant_text(payload: AssistantTextIn):
         # persist turns
         db_add_turn(payload.conversation_id, "user", payload.text)
         db_add_turn(payload.conversation_id, "assistant", parsed.reply_text)
+
+        # 自動記憶処理（要約 + 知識抽出）— 非ブロッキングで実行
+        if MEMORY_ENABLED and mem is not None:
+            try:
+                mem.auto_process_memory(payload.conversation_id, client)
+            except Exception as e:
+                print(f"[WARN] auto_process_memory: {e}")
 
         return AssistantTextOut(reply_text=parsed.reply_text, emotion_tag=parsed.emotion_tag)
 
