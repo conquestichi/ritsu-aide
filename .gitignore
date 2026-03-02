@@ -18,7 +18,7 @@ venv/
 *.save
 _bk_*/
 _bak/
-_patches/
+/_patches/
 bak/
 
 # === Logs ===
