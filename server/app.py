@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel, Field
 from prometheus_client import CollectorRegistry, Counter, generate_latest, CONTENT_TYPE_LATEST
 
@@ -361,8 +361,16 @@ def metrics():
     return generate_latest(REGISTRY), 200, {"Content-Type": CONTENT_TYPE_LATEST}
 
 
+def _safe_auto_memory(conversation_id: str, client) -> None:
+    """Background task: run auto_process_memory without blocking the response."""
+    try:
+        mem.auto_process_memory(conversation_id, client)
+    except Exception as e:
+        print(f"[WARN] auto_process_memory: {e}")
+
+
 @app.post("/assistant/text", response_model=AssistantTextOut)
-def assistant_text(payload: AssistantTextIn):
+def assistant_text(payload: AssistantTextIn, background_tasks: BackgroundTasks):
     REQ_TOTAL.labels("/assistant/text", "200").inc()
 
     # 記憶コマンド検出（"覚えて"/"忘れて"/"記憶一覧"）
@@ -401,12 +409,9 @@ def assistant_text(payload: AssistantTextIn):
         db_add_turn(payload.conversation_id, "user", payload.text)
         db_add_turn(payload.conversation_id, "assistant", parsed.reply_text)
 
-        # 自動記憶処理（要約 + 知識抽出）— 非ブロッキングで実行
+        # 自動記憶処理（要約 + 知識抽出）— BackgroundTasks で非ブロッキング
         if MEMORY_ENABLED and mem is not None:
-            try:
-                mem.auto_process_memory(payload.conversation_id, client)
-            except Exception as e:
-                print(f"[WARN] auto_process_memory: {e}")
+            background_tasks.add_task(_safe_auto_memory, payload.conversation_id, client)
 
         return AssistantTextOut(reply_text=parsed.reply_text, emotion_tag=parsed.emotion_tag)
 
