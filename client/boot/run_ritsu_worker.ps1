@@ -6,14 +6,15 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
 function Ensure-Dir([string]$p){
   New-Item -ItemType Directory -Force -Path $p | Out-Null
 }
 
 function Load-Env {
-  $cwd = Get-Location
-  $p1 = Join-Path $cwd ".ritsu_worker.env"
-  $p2 = Join-Path $cwd "ritsu_worker.env"
+  $p1 = Join-Path $ScriptDir ".ritsu_worker.env"
+  $p2 = Join-Path $ScriptDir "ritsu_worker.env"
   $path = if(Test-Path $p1){ $p1 } elseif(Test-Path $p2){ $p2 } else { throw "env not found: .ritsu_worker.env / ritsu_worker.env" }
 
   $raw = Get-Content -Raw -Encoding UTF8 $path
@@ -48,12 +49,14 @@ function Doctor {
   $base = $env:RITSU_BASE_URL
   if(-not $base){ $base = "http://127.0.0.1:8181" }
 
+  $pyWorker = Join-Path $ScriptDir "ritsu_worker_notify.py"
+
   "== DOCTOR ==" | Out-Host
   ("env: " + $envPath) | Out-Host
   ("base: " + $base) | Out-Host
   ("token: " + (MaskLen $env:RITSU_BEARER_TOKEN)) | Out-Host
   ("worker_id: " + $env:RITSU_WORKER_ID) | Out-Host
-  ("ps_worker: " + (Test-Path "C:\tools\ritsu\ritsu_worker.ps1")) | Out-Host
+  ("py_worker: " + (Test-Path $pyWorker) + " (" + $pyWorker + ")") | Out-Host
   ("vmc_sender: " + $env:RITSU_VMC_SENDER) | Out-Host
   ("vmc_map: " + $env:RITSU_VMC_MAP_PATH) | Out-Host
 
@@ -79,19 +82,25 @@ function Start-Worker {
   $out = Join-Path $logdir ("worker_live_{0}.log" -f $ts)
   $err = Join-Path $logdir ("worker_live_{0}.err.log" -f $ts)
 
-  $psWorker = "C:\tools\ritsu\ritsu_worker.ps1"
+  # Python worker (the canonical 1325-line version)
+  $pyWorker = Join-Path $ScriptDir "ritsu_worker_notify.py"
+
+  # Find python
+  $py = $null
+  try { $py = (Get-Command python -ErrorAction Stop).Source } catch {}
+  if ([string]::IsNullOrWhiteSpace($py)) { $py = "C:\Users\conqu\AppData\Local\Programs\Python\Python313\python.exe" }
 
   try {
-    Set-Content -Encoding UTF8 $out ("[BOOT] worker(ps1) base={0} id={1}" -f $base,$workerId)
+    Set-Content -Encoding UTF8 $out ("[BOOT] worker(py) base={0} id={1}" -f $base,$workerId)
     Set-Content -Encoding UTF8 $err ""
 
-    if(-not (Test-Path $psWorker)){
-      Add-Content -Encoding UTF8 $err ("[ERR] missing: {0}" -f $psWorker)
-      throw "worker script missing: $psWorker"
+    if(-not (Test-Path $pyWorker)){
+      Add-Content -Encoding UTF8 $err ("[ERR] missing: {0}" -f $pyWorker)
+      throw "worker script missing: $pyWorker"
     }
 
-    $arg = @("-NoLogo","-NoProfile","-ExecutionPolicy","Bypass","-File",$psWorker,"-Base",$base,"-WorkerId",$workerId)
-    $p = Start-Process -FilePath "powershell" -ArgumentList $arg -WindowStyle Hidden -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    $arg = @("-u", $pyWorker)
+    $p = Start-Process -FilePath $py -ArgumentList $arg -WorkingDirectory $ScriptDir -WindowStyle Hidden -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
 
     Start-Sleep -Milliseconds 400
     if($p.HasExited){
@@ -111,7 +120,7 @@ function Start-Worker {
 
 function Stop-Worker {
   Load-Env | Out-Null
-  Stop-ByCommandLineRegex 'C:\\tools\\ritsu\\ritsu_worker\.ps1|ritsu_worker_notify\.py|ritsu_worker\.ps1'
+  Stop-ByCommandLineRegex 'ritsu_worker_notify\.py|ritsu_worker\.ps1'
   "OK worker_stop" | Out-Host
 }
 
@@ -119,7 +128,7 @@ function HotkeyStart {
   Load-Env | Out-Null
   $ahk = $env:RITSU_AHK_EXE
   if(-not $ahk){ throw "RITSU_AHK_EXE missing in env" }
-  $script = Join-Path (Get-Location) "tts_hotkey.ahk"
+  $script = Join-Path $ScriptDir "tts_hotkey.ahk"
   if(-not (Test-Path $script)){ throw "missing: $script" }
   Start-Process -FilePath $ahk -ArgumentList @($script) | Out-Null
   "OK hotkey_start" | Out-Host

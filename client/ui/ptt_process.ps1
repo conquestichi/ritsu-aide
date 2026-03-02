@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 
 $BaseDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StateDir = Join-Path $env:LOCALAPPDATA "RitsuWorker"
-$ToolDir  = "C:\tools\ritsu"
+$ToolDir  = $BaseDir
 New-Item -Force -ItemType Directory $StateDir | Out-Null
 
 $WavFile   = Join-Path $StateDir "ptt.wav"

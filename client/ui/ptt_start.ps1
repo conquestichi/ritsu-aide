@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 [System.Net.ServicePointManager]::Expect100Continue = $false
 
 $StateDir = Join-Path $env:LOCALAPPDATA "RitsuWorker"
-$ToolDir  = "C:\tools\ritsu"
+$ToolDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 New-Item -Force -ItemType Directory $StateDir | Out-Null
 
 $Script = Join-Path $ToolDir "ritsu_ptt_rec.py"

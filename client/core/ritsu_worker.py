@@ -327,7 +327,7 @@ def _vmc_emit_expr(emotion_tag: str, hold_ms: int) -> None:
             return
         host = os.getenv("RITSU_VMC_HOST", "127.0.0.1")
         port = int(os.getenv("RITSU_VMC_PORT", "39539"))
-        sender = os.getenv("RITSU_VMC_SENDER", r"C:\tools\ritsu\vmc_send_pyosc.py")
+        sender = os.getenv("RITSU_VMC_SENDER", os.path.join(os.path.dirname(__file__), "vmc_send_pyosc.py"))
         map_path = os.getenv("RITSU_VMC_MAP_PATH", os.path.join(os.path.dirname(__file__), "vmc_expr_map.json"))
 
         tag = (emotion_tag or "").strip().lower()
