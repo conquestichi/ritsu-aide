@@ -57,7 +57,7 @@ if ([string]::IsNullOrWhiteSpace($Text)) {
     Write-U8 $ReplyPath "ERR: send_text.txt missing"
     exit 2
   }
-  $Text = Get-Content -Raw $SendPath
+  $Text = Get-Content -Raw -Encoding UTF8 $SendPath
 }
 
 $Headers = @{
