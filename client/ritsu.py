@@ -347,10 +347,9 @@ class TTSEngine:
 
     def _is_sexy(self, text: str) -> bool:
         t = text.strip()
-        if not t: return False
-        if any(w in t for w in self.SEXY_WORDS) and len(t) <= 28:
-            return True
-        if t.endswith(("…", "。", "？", "?")) and len(t) <= 22:
+        if not t or len(t) > 20: return False
+        # Only very short sweet phrases
+        if any(w in t for w in self.SEXY_WORDS) and len(t) <= 15:
             return True
         return False
 
