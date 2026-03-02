@@ -301,12 +301,15 @@ class TTSEngine:
 
     def speak(self, text: str) -> None:
         if text.strip():
+            log(f"[TTS] queued: {text[:50]}...")
             self._queue.put(text.strip())
 
     def _worker(self) -> None:
         import urllib.request, urllib.parse
+        log("[TTS] worker thread started")
         while True:
             text = self._queue.get()
+            log(f"[TTS] processing: {text[:50]}...")
             try:
                 chunks = self._split(text)
                 for chunk, pause in chunks:
@@ -314,7 +317,9 @@ class TTSEngine:
                     preset = self.PRESETS[style]
                     style_name = "セクシー" if style == "sexy" else "あまあま"
                     sid = self._resolve_style(style_name)
+                    log(f"[TTS] style={style_name} sid={sid}")
                     if sid is None:
+                        log(f"[TTS] SKIP: could not resolve style '{style_name}'")
                         continue
                     # audio_query
                     q = urllib.parse.urlencode({"text": chunk, "speaker": sid})
@@ -335,6 +340,7 @@ class TTSEngine:
                     # play
                     tmp = Path(os.environ.get("TEMP", ".")) / "ritsu_tts_out.wav"
                     tmp.write_bytes(wav)
+                    log(f"[TTS] playing {len(wav)} bytes")
                     import winsound
                     winsound.PlaySound(str(tmp), winsound.SND_FILENAME)
                     time.sleep(pause)
@@ -738,6 +744,7 @@ class RitsuGUI:
             elapsed = time.time() - t0
             reply = data.get("reply_text", "(no reply)")
             tag = data.get("emotion_tag", "neutral")
+            log(f"[GUI] reply received: tag={tag} len={len(reply)}")
             self.root.after(0, self._on_reply, reply, tag, elapsed)
             # TTS + VMC in background
             self.tts.speak(reply)
