@@ -353,20 +353,29 @@ class TTSEngine:
             return self._style_cache[cache_key]
         try:
             import urllib.request
-            speakers = json.loads(
-                urllib.request.urlopen(f"{self.base}/speakers", timeout=3).read().decode())
+            raw = urllib.request.urlopen(f"{self.base}/speakers", timeout=3).read()
+            speakers = json.loads(raw.decode("utf-8"))
             for sp in speakers:
-                if sp.get("name") == self.speaker_name or self.speaker_name in sp.get("name", ""):
+                sp_name = sp.get("name", "")
+                if sp_name == self.speaker_name or self.speaker_name in sp_name:
+                    log(f"[TTS] found speaker: {sp_name}")
                     for st in sp.get("styles", []):
-                        if st.get("name") == style_name:
-                            self._style_cache[cache_key] = int(st["id"])
-                            return int(st["id"])
+                        st_name = st.get("name", "")
+                        log(f"[TTS]   style: '{st_name}' id={st.get('id')}")
+                        if st_name == style_name:
+                            sid = int(st["id"])
+                            self._style_cache[cache_key] = sid
+                            log(f"[TTS]   MATCH: {style_name} → {sid}")
+                            return sid
+                    # Fallback: first style
                     if sp.get("styles"):
                         sid = int(sp["styles"][0]["id"])
                         self._style_cache[cache_key] = sid
+                        log(f"[TTS]   fallback to first style: {sid}")
                         return sid
+            log(f"[TTS] speaker '{self.speaker_name}' not found in {len(speakers)} speakers")
         except Exception as e:
-            log(f"[TTS] speaker resolve failed: {e}")
+            log(f"[TTS] speaker resolve EXCEPTION: {e}")
         return None
 
     def _is_sexy(self, text: str) -> bool:
