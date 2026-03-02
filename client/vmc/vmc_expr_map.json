@@ -1,0 +1,20 @@
+﻿{
+  "neutral": "Neutral",
+  "calm": "Neutral",
+  "think": "Neutral",
+  "happy": "Joy",
+  "laugh_weak": "Joy",
+  "laugh": "Fun",
+  "laugh_strong": "Fun",
+  "smug": "Fun",
+  "excited": "Fun",
+  "shy": "Joy",
+  "sad": "Sorrow",
+  "sorry": "Sorrow",
+  "apologize": "Sorrow",
+  "angry": "Angry",
+  "annoyed": "Angry",
+  "warn": "Angry",
+  "surprised": "Surprised",
+  "blink": "Blink"
+}

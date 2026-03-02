@@ -1,0 +1,56 @@
+# === Secrets ===
+.env
+*.env
+ritsu_token.txt
+openai_key.txt
+ritsu_url.txt
+
+# === Python ===
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# === Backups (the mess we're cleaning up) ===
+*.bak*
+*.broken*
+*.bk_*
+*.save
+_bk_*/
+_bak/
+_patches/
+bak/
+
+# === Logs ===
+*.log
+*.log.txt
+
+# === State (runtime, not versioned) ===
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+memory.json
+monologue_state_*.json
+worker.pid
+PIDFILE
+ptt.wav
+ptt_text.txt
+reply_ptt.txt
+ptt_process.lock
+
+# === Temp ===
+tmp_out.txt
+ahk_out.txt
+ahk_err.txt
+q.txt
+ritsu_in.txt
+ritsu_out.txt
+emotion_tag.txt
+
+# === OS ===
+Thumbs.db
+.DS_Store
+
+# === IDE ===
+.vscode/
+.idea/

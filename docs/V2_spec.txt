@@ -1,0 +1,184 @@
+【最新版】V2開発 0メモ（フェーズ別・移行ゲート込み）v2.0｜2026-02-01 JST
+0) 目的（V2のゴール）
+
+VPS上の 律（ritsu :8181） を「常駐秘書」として 拡張可能な形に進化させる。
+V1で成立した E2E（小窓/音声→返信表示→TTS→口パク） を壊さず、V2で以下を追加する：
+
+表情/仕草の自動化（OSC/VMCなど外部連携）
+
+独り言タイマー（条件付き、暴走防止）
+
+常駐/非同期（イベント駆動）を“事故らず”運用できる観測性と復旧性
+
+V1/V2の契約を分離し、ルーム移動でも劣化しない「仕様・運用・手順」を固定
+
+1) 最重要方針（壊す/継承の判断軸）
+継承（V1で勝ってる骨格）
+
+責務分離：Windows＝I/O/UI/TTS/アバター、VPS＝判断/記憶/API
+
+閉域前提：Tailscale 直通＋公開IP遮断＋Bearer認証
+
+短文・構造化出力・上限制御で運用に耐える
+
+VOICEVOX運用（起動順/分割/プリセット）が確立（安定稼働）
+
+破壊（V2で捨てる/分離する）
+
+V1の単一エンドポイントに拡張を混ぜない（互換事故の元）
+→ V1は凍結、V2は別契約で拡張する（下記のAPI設計）
+
+2) V2の契約（API/イベント/状態）
+2-1) エンドポイント方針（V1凍結＋V2新設）
+
+V1（凍結）：POST /assistant/text
+
+レスポンスは2キー固定：{ reply_text, emotion_tag } のみ
+
+Windows既存資産（PS/AHK）がこれで“永続稼働”できることが最優先
+
+V2（新設）：POST /assistant/v2（※名称はこのまま固定推奨）
+
+拡張JSONを返す（TTS制御・行動命令・デバッグ・イベント投入）
+
+監視：GET /ready, GET /health（必要なら /metrics）
+
+2-2) V2レスポンス（拡張JSONの標準形）
+
+（“会話”と“行動”を分離して、常駐/非同期で事故らない形）
+
+reply_text：画面表示本文
+
+should_speak：読み上げON/OFF（既定ON）
+
+emotion_tag：表情辞書キー（calm/happy/sorry/warn/think/neutral 等）
+
+actions[]：非同期で実行する命令（例：vmc_expression, vmc_gesture, notify, copy, open_url）
+
+debug：request_id, timings_ms, mode, warnings[] など（V2のみ）
+
+重要ルール
+
+**会話（同期）**は必ず返す（UIが止まらない）
+
+**行動（非同期）**は失敗しても会話を巻き込まない（action失敗はログへ）
+
+2-3) 状態（記憶）の版管理
+
+V2からは「更新ルール」と「schema_version」を必須化して、ルーム移動でも壊れないよう固定する。
+
+永続メモ：memory.json（要約中心、肥大化させない）
+
+schema_version, persona, prefs, facts, safety_limits を持つ
+
+短期スタック：SQLite（conversation_idごと）
+
+直近Nターン＋短要約を保持（入力コスト抑制）
+
+イベント/アクションキュー：SQLite（最小でOK）
+
+queued_actions テーブル（state=queued/running/done/failed、retries、next_run_at）
+
+3) アーキテクチャ（論理構造）
+3-1) レイヤ分割
+
+Windows（UI/Body）
+
+小窓入力、PTT音声、表示、TTS、アバター（常駐）
+
+VPS（Brain）
+
+V1/V2 API、短期スタック、永続メモ、OpenAI呼び出し、ポリシー（上限/整形）
+
+VPS or Windows（Action Worker）
+
+OSC/VMC送信、独り言タイマー、通知、自己復旧
+
+キュー駆動（会話APIとは分離）
+
+3-2) 常駐/非同期の境界（事故防止の芯）
+
+同期：/assistant/text（V1）・/assistant/v2（V2）＝1req 1resp
+
+非同期：actions[] 実行・独り言タイマー・再接続/復旧＝キュー処理
+
+抑制：夜間/連投/フルスクリーン等の 暴走防止ポリシー をV2で標準装備
+
+4) 開発手順（フェーズ分解・依存関係・巻き戻し）
+Phase 0：V1凍結（互換の土台を固定）
+
+V1 /assistant/text を 2キー固定で凍結
+
+経路の優先順位を固定：Tailnet直通が正、トンネルは副（フォールバック）
+
+Bearer必須は維持（/readyはTailnet内なら免除も可）
+
+Phase 1：V2プロトコル追加（まず“壊さず増やす”）
+
+POST /assistant/v2 新設
+
+拡張JSON（reply_text/should_speak/emotion_tag/actions/debug）実装
+
+actionはまだ“ダミー（空配列）”でOK、まず契約を固める
+
+Phase 2：イベント/アクション基盤（常駐の土台）
+
+actionsキュー（SQLite）導入
+
+Worker（oneshot/常駐）導入
+
+失敗しても会話は成功、actionだけ失敗ログ＋リトライ制御
+
+Phase 3：表情/仕草（OSC/VMC）
+
+emotion_tag → actions の変換辞書
+
+OSC/VMC送信（疎通/再送/タイムアウト）
+
+失敗時：actionのみfailed（会話は継続）
+
+Phase 4：独り言タイマー（条件付き）
+
+条件（例：無操作時間、時間帯、アクティブウィンドウ）
+
+抑制（連投防止・日次上限・手動停止フラグ）
+
+生成テキストはV2経由で作り、actionとして再生/表示
+
+
+
+追加　Phase 4.5：返し構成（言語フォーマット）固定 
+   
+      Phase 4.6: 独り言の内容運用（リスト/テンプレ外部化）
+
+      Phase 4.7: assistant/v2 の emotion_tag を “自動で” 表情アクションに変換してキューに載せる
+
+
+
+Phase 5：Windows側の“入口を少数化”（再現性の最終仕上げ）
+
+PS/AHK/Pythonの点在を、1〜2個の入口スクリプトへ束ねる
+
+E2Eテスト（小窓→V2→表示→TTS、PTT→STT→V2→表示→TTS）を1コマンド化
+
+5) DoD（移行ゲート＝ルーム6完了条件）
+
+V2が落ちても V1だけで最低限運用できる（feature flag / fallback）
+
+Workerを止めても会話は落ちない（actionが止まるだけ）
+
+Tailnet内で /ready OK、公開IPからは遮断OK
+
+主要ログで原因追跡できる（request_id / last_err / queue_len）
+
+6) ロールバック（巻き戻し可能）
+
+V2を止めたい：
+
+V2 endpoint を無効化（または feature flag OFF）
+
+Worker停止
+
+V1 /assistant/text はそのまま稼働
+
+DB/メモは 前方互換に寄せ、V1運用に影響しない形にする

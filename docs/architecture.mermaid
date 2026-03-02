@@ -1,0 +1,60 @@
+graph TB
+    subgraph Windows["Windows（Body / I/O）"]
+        direction TB
+        AHK["tts_hotkey.ahk<br/>小窓 + PTT"]
+        PTT["ptt_process.ps1<br/>STT→送信→応答→発声"]
+        Sender["ritsu_sender<br/>POST /assistant/v2"]
+        Worker["ritsu_worker.py<br/>キューポーリング"]
+        TTS["tts_speak.py<br/>VOICEVOX 四国めたん"]
+        VMC["vmc_send.py<br/>VMagicMirror表情"]
+        Avatar["VMagicMirror<br/>VRM常駐"]
+        STT["stt_once.py<br/>Whisper"]
+        
+        AHK -->|"XButton1: 小窓"| Sender
+        AHK -->|"XButton2: PTT"| PTT
+        PTT --> STT
+        PTT --> Sender
+        Sender -->|"reply_text"| TTS
+        Worker -->|"type=emotion"| VMC
+        Worker -->|"type=notify"| Worker
+        TTS -->|"音声出力"| Avatar
+        VMC -->|"UDP 39539"| Avatar
+    end
+
+    subgraph Network["Tailscale閉域網"]
+        Tunnel["SSH Tunnel<br/>18181→8181<br/>or Tailnet直通"]
+    end
+
+    subgraph VPS["VPS（Brain / 判断・記憶）"]
+        direction TB
+        API["FastAPI :8181<br/>app.py"]
+        V1["/assistant/text<br/>V1凍結・2キー固定"]
+        V2["/assistant/v2<br/>V2拡張JSON"]
+        Queue["/actions/next,done,failed<br/>キューAPI"]
+        LLM["OpenAI API<br/>GPT呼び出し"]
+        
+        subgraph State["状態（/srv/ritsu/state/）"]
+            Mem["memory.json<br/>永続メモ・人格"]
+            History["assistant.sqlite<br/>会話履歴"]
+            Actions["actions.sqlite<br/>actionsキュー"]
+        end
+        
+        API --> V1
+        API --> V2
+        API --> Queue
+        V2 -->|"LLM呼び出し"| LLM
+        V2 -->|"auto_emotion"| Actions
+        V2 -->|"auto_speak"| Actions
+        V2 -->|"履歴保存"| History
+        V1 -->|"参照"| Mem
+        V1 -->|"参照"| History
+    end
+
+    Sender -->|"Bearer認証"| Tunnel
+    Tunnel --> API
+    Worker -->|"GET /actions/next"| Tunnel
+
+    style Windows fill:#1a1a2e,stroke:#e94560,color:#fff
+    style VPS fill:#1a1a2e,stroke:#0f3460,color:#fff
+    style Network fill:#16213e,stroke:#533483,color:#fff
+    style State fill:#0f3460,stroke:#e94560,color:#fff

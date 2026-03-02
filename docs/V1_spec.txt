@@ -1,0 +1,193 @@
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-01 JST
+0) V1の目的（成立している最小運用）
+
+VPS常駐の律APIに POST /assistant/text を実装し、Windowsから呼び出して
+返信表示＋ローカルTTS＋アバター口パクまでをE2Eで成立させる。
+
+1) 全体構成（責務分離）
+
+VPS（ritsu :8181）：判断・記憶・API（LLM呼び出し含む）
+
+Windows：入力（小窓/音声）・表示・TTS・アバター常駐
+
+2) ネットワーク/セキュリティ（V1で確立）
+
+VPSは 0.0.0.0:8181 待受（systemd override）
+
+UFWで 8181はTailnet(100.64.0.0/10)のみ許可、公開IPから遮断
+
+疎通：Tailnet IP では /ready OK、公開IPでは timeout（遮断成功）
+
+3) 認証（Bearer）
+
+Ritsu API：Bearer middleware導入済み
+
+トークン配置（実値は書かない）
+
+VPS：/opt/agents/ritsu/.env に RITSU_BEARER_TOKEN（len=64）
+
+Windows：%USERPROFILE%\.ritsu\ritsu_token.txt（len=64）
+
+URL：%USERPROFILE%\.ritsu\ritsu_url.txt（例：http://100.x.x.x:8181）
+
+4) API仕様（V1＝凍結対象）
+4-1) GET /ready
+
+200：{"status":"ready"}
+
+用途：受付可チェック（readiness）
+
+4-2) GET /health
+
+200：{"status":"ok"}
+
+用途：死活（liveness）
+
+4-3) POST /assistant/text（V1の最重要契約）
+
+Request
+
+{
+  "conversation_id": "vm",
+  "text": "ping"
+}
+
+Response：必ずこの2キーのみ（これ以外は返さない）
+
+{
+  "reply_text": "…",
+  "emotion_tag": "calm"
+}
+
+emotion_tag許容：calm | happy | sorry | warn | think | neutral
+
+重要ルール：
+
+返答はJSONのみ（前置き/装飾/コードブロック禁止）
+
+例外時も200で返す（UI/TTS連携を止めない：emotion_tag=warn等）
+
+5) 記憶（V1）
+
+永続メモ（JSON）：/srv/ritsu/state/memory.json（version=1）
+
+短期履歴（SQLite）：/srv/ritsu/state/assistant.sqlite
+
+conversation_id単位で user/assistant turn を保存し直近Nターン参照
+
+6) Windows側クライアント（V1の正本）
+6-1) PowerShellクライアント（最小運用の正本）
+
+C:\Users\conqu\tts\ritsu_call.ps1
+
+/assistant/text をBearer付きで叩き、reply_text本文のみを標準出力
+
+単体テスト
+
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\conqu\tts\ritsu_call.ps1 -Text "ping"
+
+6-2) 小窓（AHK）＋送信
+
+C:\Users\conqu\tts\tts_hotkey.ahk
+
+小窓で入力→送信→返信表示
+
+PTTは環境差対策で F10を保険キーとして常備
+
+6-3) STT（音声→テキスト）
+
+C:\Users\conqu\tts\stt_once.py（依存：Python3系、sounddevice、openai）
+
+出力：%TEMP%\ritsu_stt_out.txt（utf-8） / ..._err.txt
+
+単体テスト
+
+python C:\Users\conqu\tts\stt_once.py --sec 3 --out $env:TEMP\ritsu_stt_out.txt --err $env:TEMP\ritsu_stt_err.txt
+Get-Content -Encoding utf8 $env:TEMP\ritsu_stt_out.txt
+
+7) TTS運用（V1で完成）
+
+読み上げ：VOICEVOX（四国めたん）
+
+起動順の自動化：tts_boot.ps1 → engine ready待ち → AHK起動
+
+正本：
+
+C:\Users\conqu\tts\tts_boot.ps1
+
+C:\Users\conqu\tts\tts_speak.py
+
+C:\Users\conqu\tts\tts_hotkey.ahk
+
+ログ：
+
+C:\Users\conqu\tts\tts_boot.log
+
+C:\Users\conqu\tts\ahk_hotkey.log
+
+7-1) 文章分割ルール（tts_speak.py 内）
+
+空行（2改行以上）：段落分割（段落末ポーズ長め）
+
+文末記号（。！？!?♪）：文単位で分割
+
+1文80文字超：読点「、」で自然分割
+
+それでも120文字超：120文字ごと強制カット
+
+短すぎ断片（<10文字）：前チャンクに吸収
+
+ポーズ：段落末0.45 / 「。」0.30 / 「!?」0.20 / 他0.15
+
+7-2) めたん（あまあま/セクシー）プリセット（auto判定）
+
+style_id固定は避け、/speakersから名前解決
+
+セクシー判定（例）：挨拶語＋短文＋語尾等
+
+パラメータ例：
+
+あまあま：speed0.98 / pitch0.00 / intonation1.20 / volume1.00
+
+セクシー：speed0.92 / pitch-0.04 / intonation1.05 / volume0.95
+
+8) アバター常駐（V1で成立）
+
+VRM：BOOTH「Grus」
+
+表示：VMagicMirror 常駐
+
+Windows起動後自動起動：ON
+
+同じVRMを次回も読み込む：ON
+
+起動直後最小化：任意ON
+
+背景：グリーン（OBSクロマキー運用可：OBS Studio）
+
+口パク：**TTS音量拾い（仮想マイク/マイク入力）**で成立
+
+表情：V1では“仕込みのみ”、本格連動はV2（iFacialMocap/VMC）へ
+
+9) 既知のハマりどころ（再発防止）
+
+PowerShell 5.1は一部構文が使えない → PS5.1互換で固定
+
+curl は PowerShellの別物（エイリアス混乱） → Invoke-RestMethod推奨
+
+文字化け：Get-Content -Encoding utf8 を徹底
+
+AHKにPowerShellのヒアドキュメント混入で即死 → 編集は全置換が安全
+
+10) 最低チェック（運用ショート）
+
+Windows（Tailnet内）
+
+irm http://100.x.x.x:8181/ready
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\conqu\tts\ritsu_call.ps1 -Text "ping"
+
+VPSローカル
+
+curl -fsS http://127.0.0.1:8181/ready
+curl -fsS http://127.0.0.1:8181/health
+

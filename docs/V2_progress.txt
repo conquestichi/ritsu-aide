@@ -1,0 +1,1372 @@
+V２開発　現在進行メモ　
+
+
+各ルームでフェーズ終了時にメモを残し追記していきます 時系列順に今の状態になります
+
+
+
+
+Phase0完了：/assistant/text は reply_text / emotion_tag の2キー固定で凍結確認済み（Bearer有りで200、keys検証OK）
+
+トークン取得元：/opt/agents/ritsu/.env の RITSU_BEARER_TOKEN（len=64で一致、末尾6文字で整合）
+
+
+
+Phase1完了：POST /assistant/v2 実装済み（V1 /assistant/text は2キー固定維持）
+
+V2レスポンス：reply_text, should_speak, emotion_tag, actions, debug
+
+actions は常に []（ダミー）／debug.mode="v2"
+
+ルート確認：/assistant/text と /assistant/v2 登録済み
+
+掃除：app.py.bak.* は最新5件残しで整理、/assistant/v2 定義は1箇所に統一　
+
+
+（Phase2完了・最新）
+
+【律再起動V2｜Phase2 進行メモ（完了）｜2026-02-05 JST】
+
+■ 状態
+
+ritsu.service（:8181）稼働OK（uvicorn）
+
+Phase2（Actions Queue / actions_in merge / endpoints）E2Eで疎通完了
+
+重要：Bearertoken 未セット/別シェルだと /actions/* が unauthorized になる（TOK固定で叩く）
+
+■ Phase2でやったこと（成果物）
+
+app.py 修正（/opt/agents/ritsu/app.py）
+
+v2の actions_in を正規化して actions に“そのまま反映”（E2E echo/merge）
+
+speak/emotion は レスポンスで返す（クライアント実行想定）
+
+notify 等の speak/emotion以外 は enqueue（DBキュー） に積む（返信をブロックしない）
+
+/actions/next /actions/done /actions/failed のエンドポイントを追加
+
+以前の NameError（ALLOWED_EMOTIONSS）系は解消済み
+
+actions_queue.py 実装（/opt/agents/ritsu/actions_queue.py）
+
+SQLite queue（queued_actions）
+
+enqueue / pick_next / mark_done / mark_failed
+
+busy_timeout / foreign_keys 有効
+
+systemd/ENV 周りの詰まりを解消（SQLite open error 対策）
+
+DBパスを /srv/ritsu/state/actions.sqlite に統一
+
+実体ファイル作成＆権限/親dirの実行権（x）を確保
+
+drop-in 追加：/etc/systemd/system/ritsu.service.d/actionsdb.conf
+
+Environment="RITSU_ACTIONS_DB_PATH=/srv/ritsu/state/actions.sqlite"
+
+Environment="RITSU_ENABLE_ACTIONS_ENQUEUE=1"
+
+systemctl daemon-reload && systemctl restart ritsu.service で反映
+
+■ 検証結果（E2E）
+
+/assistant/v2 に actions_in:[{"type":"notify","payload":{"text":"HELLO_NOTIFY"}}] を渡す
+
+レスポンス：actions に notify/speak/emotion が揃って返る
+
+かつ notify はキューに積まれる
+
+/actions/next?worker_id=test1
+
+item.id が返る（例：id=2、type=notify）
+
+/actions/done
+
+{"ok": true} で完了できる
+
+
+# トークン固定
+set -a; source /opt/agents/ritsu/.env; set +a
+TOK="$RITSU_BEARER_TOKEN"
+
+# enqueue（notifyを積む）
+curl -sS -X POST http://127.0.0.1:8181/assistant/v2 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOK" \
+  -d '{"conversation_id":"win","text":"ping","actions_in":[{"type":"notify","payload":{"text":"HELLO_NOTIFY"}}]}' >/dev/null
+
+# pick
+curl -sS "http://127.0.0.1:8181/actions/next?worker_id=test1" \
+  -H "Authorization: Bearer $TOK" | python3 -m json.tool
+
+# done（idを指定）
+curl -sS -X POST http://127.0.0.1:8181/actions/done \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOK" \
+  -d '{"action_id":2}' | python3 -m json.tool
+
+■ 残タスク（次＝Phase3）
+
+Windows側ワーカー（client executor）を作る：poll → notify表示 → done/failed
+
+その後：notify→Slack/Toast、speak→TTS、emotion→VMagic/VTube連携へ拡張
+
+方式：最小は Python requests でOK（後で常駐化/タスクスケジューラ）
+
+
+OK、再起動後も完全に動作しています。
+ログで AFTER_REBOOT_OK を PICK → DONE 200 まで確認できたので、Phase3（Windowsワーカー最小）は 完了です。
+
+Phase3 完了メモ（コピペ1枚）
+目的
+
+Windows側で actions キューをポーリングし、notify を表示 → done 送信で消化する最小ワーカーを常駐化。
+
+成果物
+
+Windowsワーカー：C:\Users\conqu\tts\ritsu_worker_notify.py
+
+起動スクリプト：C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+自動起動：スタートアップに run_ritsu_worker.cmd を配置
+"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\run_ritsu_worker.cmd"
+
+ログ：%USERPROFILE%\AppData\Local\RitsuWorker\worker_YYYYMMDD.log
+
+Windows（手動起動）
+cd C:\Users\conqu\tts
+python .\ritsu_worker_notify.py
+
+Windows（常駐：スタートアップ方式）
+
+タスクスケジューラ：E_ACCESSDENIEDで不可 → スタートアップ方式を採用
+
+起動コマンド（手動テストも可）：
+
+& "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\run_ritsu_worker.cmd"
+
+
+ログ確認：
+
+start notepad "$env:USERPROFILE\AppData\Local\RitsuWorker\worker_$(Get-Date -Format yyyyMMdd).log"
+
+VPS enqueue（疎通テスト）
+set -a; source /opt/agents/ritsu/.env; set +a
+TOK="$RITSU_BEARER_TOKEN"
+curl -sS -X POST http://127.0.0.1:8181/assistant/v2 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOK" \
+  -d '{"conversation_id":"win","text":"ping","actions_in":[{"type":"notify","payload":{"text":"AFTER_REBOOT_OK"}}]}' >/dev/null
+
+期待ログ（実績）
+
+Windowsログ：
+
+[PICK] id=5 text=AFTER_REBOOT_OK
+[DONE] id=5 status=200
+
+切り分け早見
+
+401：トークン不一致（余計な文字混入／長さズレ）
+
+ConnectTimeout：再起動直後に経路未確立（必要なら cmd に待機や疎通待ちを入れる）
+
+無反応：キュー空（正常）／enqueueして確認
+
+進行メモ追記｜V2 Phase3 完了〜Phase4 予告（2026-02-08 JST）
+要点（現状の到達点）
+
+Windows 側に Ritsu Worker（notify + emotion/VMC expression + gesture） を常駐化。
+
+/actions/next をポーリングして、notify は確実に拾えてログに出る（status=200）。
+
+VMagicMirror は VMCP受信（表情） を有効化し、BlendShape を外部から叩ける状態。
+
+表情は当面 5種（Neutral/Happy/Sad/Angry/Surprised） で運用。
+
+vmc_expr_map.json の BOM/パス問題を潰して読み込み安定。
+
+まだ /assistant/v2 の emotion_tag を自動で enqueue する処理は未実装 → Phase4。
+
+Phase3で出来たこと（実装＆運用の確定）
+1) Windows Worker（常駐）
+
+ritsu_worker_notify.py が以下を実行：
+
+GET RITSU_BASE_URL/actions/next?worker_id=...
+
+type=notify → ログ出力
+
+type=emotion/vmc_expression → VMC(UDP)で BlendShape を適用
+
+type=gesture → pyautoguiでホットキー送出（任意）
+
+2) VMagicMirror 側（設定）
+
+VMC Protocol タブ：
+
+✅「VMCPによる受信を有効化」
+
+受信元の設定：ポート=39539
+
+✅「表情」にチェック
+
+「変更を適用」
+
+3) 表情マッピング（5種固定）
+
+C:\Users\conqu\tts\vmc_expr_map.json（UTF-8 BOMなし）で運用
+例：
+
+neutral → Neutral
+
+happy → happy
+
+sad → Sorrow
+
+angry → Angry
+
+surprised → Surprised
+
+4) 自動起動（スタートアップ方式で確定）
+
+スタートアップフォルダには 小さい呼び出し役だけ置く（事故防止）
+
+run_ritsu_worker_startup.cmd（中身：本体cmdを call）
+
+本体は固定パス：
+
+C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+本体cmdには /ready 待ちを入れて、起動順レースを回避。
+
+現在の正（ファイル配置）
+
+C:\Users\conqu\tts\ritsu_worker_notify.py
+
+C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+C:\Users\conqu\tts\vmc_expr_map.json
+
+スタートアップ：
+
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\run_ritsu_worker_startup.cmd のみ
+
+動作確認（チェック観点）
+
+Windows Worker ログに以下が出る：
+
+start loop (notify + emotion/vmc_expression + gesture)
+
+enqueueしたnotifyが来ると：
+
+[PICK] id=... type=notify
+
+[NOTIFY] ...
+
+[DONE] id=... status=200
+
+expression が来ると：
+
+[PICK] id=... type=emotion または vmc_expression
+
+[VMC] name=... value=... hold_ms=...
+
+※見た目で表情が変わる
+
+▶ Phase4（次フェーズ）仕様：emotion_tag → 自動enqueue
+目的
+
+/assistant/v2 が返した emotion_tag を、サーバ側で自動的に actions(type=emotion) に積む
+
+クライアント側が actions_in を組み立てなくても、会話→感情→表情 が自動でつながる
+
+方針（仕様案）
+
+/assistant/v2 応答生成後に：
+
+emotion_tag が空でない＆（必要なら）neutral 以外なら enqueue
+
+例：{"type":"emotion","payload":{"tag": emotion_tag, "hold_ms":900}}
+
+スパム防止：
+
+同一tagの連打は抑制（cooldown or last_tag記憶）
+
+ゲート：
+
+ENABLE_AUTO_EMOTION=1 のときのみ有効（運用でON/OFF可能）
+
+Phase4完了条件
+
+/assistant/v2 を普通に叩くだけで
+
+サーバが emotion を enqueue
+
+Windows Worker が /actions/next で拾い
+
+VMagicMirror 表情が自動で変わる
+
+次アクション
+
+Phase4の実装対象を ritsu 側 app.py（/assistant/v2 handler） に確定し、
+
+emotion_tag → enqueue_action(emotion) を追加
+
+cooldown と neutral の扱いを入れる
+
+テスト：
+
+/assistant/v2 の返却に emotion_tag=happy
+
+Windowsログで [PICK] type=emotion が出ること
+
+参考：ファイルを開くコマンド（Windows）
+notepad C:\Users\conqu\tts\run_ritsu_worker.cmd
+notepad C:\Users\conqu\tts\ritsu_worker_notify.py
+notepad C:\Users\conqu\tts\vmc_expr_map.json
+explorer "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+
+（Phase3 追記：表情/仕草・Windows worker 拡張｜2026-02-08 JST）
+
+■ 目的（追加）
+Windows側ワーカーを notify-only から拡張し、
+- VMC Protocol（VMagicMirror）へ表情（BlendShape）送信
+- Hotkeyで仕草（ジェスチャ）発火
+までを最小構成で通す。
+
+■ 現状（到達点）
+- VPS（ritsu :8181）：Phase2 Actions Queue 稼働中（/actions/next|done|failed）。
+  ※ speak/emotion はレスポンス返却（クライアント実行想定）、notify等のみ enqueue される方針は維持。
+- Windows：ritsu_worker_notify.py が以下に対応
+  - notify（表示ログ）
+  - emotion / vmc_expression（VMC BlendShape Extension 送信）
+  - gesture（pyautoguiでホットキー送信）
+
+■ Windows側 成果物/パス
+- ワーカー：C:\Users\conqu\tts\ritsu_worker_notify.py
+- 起動：C:\Users\conqu\tts\run_ritsu_worker.cmd
+- 表情マップ：C:\Users\conqu\tts\vmc_expr_map.json
+- ログ：%USERPROFILE%\AppData\Local\RitsuWorker\worker_YYYYMMDD.log
+
+■ VMagicMirror 設定
+- VMC Protocol：VMCPによる受信を有効
+- 受信ポート：39539
+- 受信項目：表情（BlendShape）をON
+
+■ run_ritsu_worker.cmd（要点）
+- RITSU_BASE_URL / RITSU_BEARER_TOKEN / WORKER_ID / poll/backoff を設定
+- VMC：RITSU_VMC_HOST=127.0.0.1 / RITSU_VMC_PORT=39539 / RITSU_VMC_MAP_PATH=.\vmc_expr_map.json
+- gesture：RITSU_GESTURE_* に割当（例：CTRL+ALT+F9/F10/F11）
+- 起動前に /ready 疎通待ち（WAIT_RITSU）
+- python ritsu_worker_notify.py を起動してログへ追記
+
+■ 表情マップ（最小5種）
+neutral / happy / sad / angry / surprised のみ運用（JSONはUTF-8で保存）
+（BOMや文字コード差で読み込みWARNになったら、UTF-8（BOM無し）で作り直す）
+
+■ スタートアップ（自動起動）
+スタートアップフォルダに「起動用cmd」を1つだけ置く（重複起動防止）。
+（例）run_ritsu_worker_startup.cmd から run_ritsu_worker.cmd を call する方式。
+
+■ 動作確認（実績）
+- VPS → /assistant/v2 で notify enqueue → Windows worker が [PICK]→[NOTIFY]→[DONE] を記録し、200で完了
+- VMagicMirror 側：VMC受信OK（表情反映確認）
+
+■ 既知仕様（重要）
+VPS側で /assistant/v2 に投げた “emotion_tag” は「返答の付帯情報」であり、
+キュー（/actions/next）へは来ない（actions_in に明示投入したものだけが来る）。
+Windows側で emotion_tag→表情反映をしたい場合は、Phase4等でクライアント側変換を実装する。
+
+Phase4：独り言タイマー（条件付き）完了メモ（2026-02-08 JST）
+目的
+
+Windows常駐worker側で「独り言」を条件付きで発火し、VPS POST /assistant/v2 で生成した reply_text / should_speak / emotion_tag を使って
+
+画面表示（notify）
+
+表情（VMC expression：neutral/happy/sad/angry/surprisedへ丸め）
+を実行する。暴走防止（cooldown / 日次上限 / stop_file）を備える。
+
+実装位置
+
+Windows側：C:\Users\conqu\tts\ritsu_worker_notify.py
+
+monologue_timer（独り言）ループを追加（worker常駐内で実行）
+
+起動スクリプト：C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+Phase4用ENVをここに集約（本番設定へ戻し済み）
+
+ログ：%USERPROFILE%\AppData\Local\RitsuWorker\worker_YYYYMMDD_HHMMSS.log
+
+本番設定（確定）
+
+run_ritsu_worker.cmd Phase4 ENV（本番）
+
+RITSU_MONOLOGUE_ENABLE=1
+
+RITSU_MONOLOGUE_IDLE_SEC=600（10分無操作で候補）
+
+RITSU_MONOLOGUE_COOLDOWN_SEC=900（15分クールダウン）
+
+RITSU_MONOLOGUE_MAX_PER_DAY=20（日次上限）
+
+RITSU_MONOLOGUE_TIME_RANGE=08:00-23:00（時間帯ゲート）
+
+RITSU_MONOLOGUE_STOP_FILE=%USERPROFILE%\.ritsu\monologue_stop.txt（存在で即停止）
+
+RITSU_MONOLOGUE_SUPPRESS_FULLSCREEN=1（フルスクリーン抑制）
+
+※テスト時は idle=10 / cooldown=0 / range=00:00-23:59 / suppress=0 で発火確認。
+
+完了条件の達成状況
+
+✅ [BOOT] monologue start enable=1 ... をログで確認（本番値で起動）
+
+✅ [MONO] fire id=... tag=... idle=... should_speak=... を確認（発火）
+
+✅ VMC表情ログ [VMC] name=Neutral ... 等が出て表情反映を確認
+
+✅ max_per_day に達すると [MONO] skip reason=max_per_day ... が出る（暴走防止）
+
+✅ stop_file で即停止できる（運用停止スイッチ）
+
+重要なトラブルと対処（運用メモ）
+
+monologue enable=0 問題
+
+原因：起動経路によってENVが読まれず enable=0 で起動するケースがあった
+
+対処：run_ritsu_worker.cmd 側で RITSU_MONOLOGUE_ENABLE=1 を確定し、ログで enable=1 を毎回確認
+
+二重起動（pythonプロセスが2本）
+
+症状：python ritsu_worker_notify.py が2本走り、ログ/設定が混線
+
+対処：プロセス停止→起動経路の整理→最終的に 1プロセスで安定稼働を確認
+監視コマンド：
+Get-CimInstance Win32_Process | ? {($_.Name -in @("python.exe","pythonw.exe")) -and ($_.CommandLine -match "ritsu_worker_notify\.py")} | select ProcessId,CommandLine
+
+文字化け（スマートクォート混入等）
+
+.cmd 編集時に “ ” が混入すると壊れる。PowerShellの Set-Content で生成し直すのが安全。
+
+運用コマンド（最低限）
+
+最新ログ（MONO行だけ）
+
+$logDir="$env:USERPROFILE\AppData\Local\RitsuWorker"
+$log=Get-ChildItem $logDir -Filter "worker_*.log" | sort LastWriteTime | select -Last 1
+Select-String -Path $log.FullName -Pattern "\[MONO\]" | select -Last 50
+
+
+即停止 / 再開
+
+New-Item -Force "$env:USERPROFILE\.ritsu\monologue_stop.txt" | Out-Null
+Remove-Item "$env:USERPROFILE\.ritsu\monologue_stop.txt" -ErrorAction SilentlyContinue
+
+次（Phase5以降のメモ）
+
+「独り言もactionsにenqueueする版」は後回しでOK（現状はローカルnotify+VMCで成立）
+
+例外系（cp932 encodeなど）が再発した場合は “落ちない” 方向の最小安定化パッチのみ追加検討
+
+【追記｜フェーズ番号の整合（重要：Phase4が二重定義になっていた件の解消）｜2026-02-08 JST】
+
+■ 結論（読み手が迷わない定義）
+- Phase3（Body/Worker拡張）：Windows worker が notify + VMC表情 + gesture を実行できる ……完了
+- Phase4（Monologue）：独り言タイマー（条件付き）を Windows 常駐で安定運用 ……完了
+- Phase3.5（Bridge：emotion_tag→action化）：/assistant/v2 の emotion_tag を “自動で” 表情アクションに変換してキューに載せる ……未着手（次）
+  ※ 既存メモの「▶ Phase4（次フェーズ）仕様：emotion_tag → 自動enqueue」は “Phase3.5” に改名して扱う（番号衝突防止）
+
+────────────────────────────────────────
+【入口統合（Single entry / 設定分裂防止）｜Phase5で固定すべき運用ルール（先にメモだけ確定）】
+
+■ 正の起動経路（これ以外は使わない）
+- 起動/停止/状態/ログ：C:\Users\conqu\tts\run_ritsu_worker.cmd
+- スタートアップ：%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\run_ritsu_worker_startup.cmd（呼び出し役のみ）
+  - 中身は「call C:\Users\conqu\tts\run_ritsu_worker.cmd start」だけにする
+
+■ 禁止ではなく“構造で起きない”にする（Phase5で実装予定）
+- 二重起動防止：lock or pid を導入し、2本目は即終了
+- python直起動対策：ritsu_worker_notify.py は RITSU_ENTRYPOINT=1 が無いと即終了（cmd経由しか動かない）
+- 設定の正本：run_ritsu_worker.cmd に集約（ENVはここだけで決まる）
+
+■ 望ましいコマンド形（運用が迷子にならない）
+- run_ritsu_worker.cmd start
+- run_ritsu_worker.cmd stop
+- run_ritsu_worker.cmd status
+- run_ritsu_worker.cmd log   （最新ログを開く）
+
+※ 現状は start 相当が中心。Phase5で stop/status/log を揃えて “1コマンド運用” に寄せる。
+
+────────────────────────────────────────
+【B) 返し構成（言語フォーマット）固定｜V2プロンプト側ルール（仕様として先に固定）】
+
+■ conversation_id を固定（テンプレ分裂防止）
+- main：通常会話（人が呼ぶ）
+- monologue：独り言（タイマー専用）
+- worker：疎通/保守（任意）
+
+■ 返答型は3つだけ（reply_text の形を固定）
+1) 通常返答（main）
+   - 結論：1行
+   - 要点：最大3つ
+   - 次アクション：1つ
+2) 作業指示（main/worker）
+   - コマンド（最上段にまとめる）
+   - ログ確認
+   - 失敗時分岐（401 / timeout / empty-queue の3本に固定）
+3) 独り言（monologue）
+   - 1〜2文＋一言（短く、温度低め、作業妨害しない）
+   - 長文禁止（目安60文字以内）
+
+■ reply_text / should_speak / emotion_tag の当面の扱い（notify中心）
+- reply_text：常に本文（唯一のソース）
+- emotion_tag：将来の表情キーとして常に返す（今も返す）
+- should_speak：現状はnotify中心のため monologue は原則 false 推奨（将来TTS導入時に利用）
+
+────────────────────────────────────────
+【C) 独り言ネタ（素材）外部化｜Phase4の発火ロジックは維持しつつ“生成素材”を安定化】
+
+■ 目的
+- 生成ブレ/暴走を抑える（固定リスト→ランダム/ローテで十分。学習/個別最適化は後回し）
+
+■ 外部素材（最小）
+- パス：%USERPROFILE%\.ritsu\monologue_seeds.json
+- 形式（例）：
+  {
+    "morning": ["…短文…"],
+    "day": ["…短文…"],
+    "night": ["…短文…"],
+    "ng": { "max_chars": 60, "no_repeat_minutes": 90, "daily_cap": 20 }
+  }
+
+■ 運用ルール（NG）
+- 連投禁止（cooldown尊重）
+- 重い話/長文/作業妨害は禁止
+- stop_file があれば即停止（既存：%USERPROFILE%\.ritsu\monologue_stop.txt）
+
+■ 実装方針（後で反映）
+- seeds.json があれば「ローテ/ランダム」優先、無ければ従来どおり /assistant/v2 生成へフォールバック
+- state（最後に出したindex/時刻）は %LOCALAPPDATA%\RitsuWorker\monologue_state.json 等に保存
+
+────────────────────────────────────────
+【次の実装レーン（Phase3.5→Phase5）】
+
+1) Phase3.5（Bridge）：
+   /assistant/v2 の emotion_tag を actions(type=vmc_expression or emotion) に自動変換（enqueue）できるようにする
+   - ゲート：ENABLE_AUTO_EMOTION=1
+   - 抑制：neutral は原則スキップ、同一tag連打cooldown
+
+2) Phase5（入口統合）：
+   run_ritsu_worker.cmd を start/stop/status/log まで拡張し、二重起動/直起動/別ショートカットを構造で封じる
+
+
+律再起動V2｜Phase3.5 完了メモ（コピペ1枚）｜2026-02-08 JST
+目的（Phase3→3.5の到達点）
+
+Windows側に常駐ワーカーを固定配置し、VPS(ritsu :8181) の actions キューをポーリング → notify / emotion(VMC) / gesture を実行 → done/failed を返すまでを、起動・ログ・運用コマンド込みで安定化。
+
+　
+
+状態（結論）
+
+Windows：run_ritsu_worker.cmd で start/stop/restart/status/logs/tail が動く（ログ出力あり）。
+
+V２開発　現在進行メモ　
+
+VPS：/assistant/v2 が Bearer で200になり、別シェル/未ロードだと unauthorized になる点も運用手順で回避できる。
+
+V２開発　現在進行メモ　
+
+E2E：Windowsログに [PICK] → [DONE] status=200 が出るので、キュー消化が確認できる。
+
+V２開発　現在進行メモ　
+
+成果物（正の配置）
+
+Windows
+
+ワーカー：C:\Users\conqu\tts\ritsu_worker_notify.py
+
+
+起動・運用：C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+　
+
+表情マップ：C:\Users\conqu\tts\vmc_expr_map.json（UTF-8 BOMなしで運用）
+
+
+
+ログ：%USERPROFILE%\AppData\Local\RitsuWorker\worker_YYYYMMDD_HHMMSS.log（＋ err.log）
+
+　
+
+VMagicMirror（Windows設定）
+
+VMC Protocol：VMCP受信を有効化 / ポート39539 / 表情にチェック / 変更を適用
+
+V２開発　現在進行メモ　
+
+運用コマンド（最低限）
+
+Windows（PowerShell）
+
+cd C:\Users\conqu\tts
+.\run_ritsu_worker.cmd status
+.\run_ritsu_worker.cmd restart
+.\run_ritsu_worker.cmd tail
+
+
+（ログパスが出る。tailで [PICK]/[DONE] を監視）
+
+　
+
+VPS（疎通テスト：enqueue/pickの前提）
+
+Bearerトークンは /opt/agents/ritsu/.env を source したシェルで固定して叩く（別シェルだと unauthorized になり得る）。
+
+V２開発　現在進行メモ　
+
+重要トラブルと学び（今回つぶした点）
+
+unauthorized：トークンが未ロード/別シェルが原因になりやすい（len一致で検証する運用が安全）。
+
+　
+
+キュー空は正常：無反応に見える時は enqueueして確認が基本。
+　
+
+次
+
+**/assistant/v2 の emotion_tag をサーバ側で自動 enqueue（feature flag付き）**にして、クライアントが actions_in を組まなくても「会話→表情」が繋がる状態へ。
+
+Phase3.5 完了メモ（AUTO_EMOTION v1 + 口調/整形チューニング）｜2026-02-09 JST
+目的
+
+/assistant/v2 が返す emotion_tag を server-side actions queue に自動投入し、Windows側ワーカー（VMagicMirror等）が表情を拾える土台を作る。
+
+返信文の“段取り語/箇条書き癖”を抑え、日常会話でも自然に返せる品質へ寄せる。
+
+**TTSで不自然になりがちな表現（括弧内・ラベル・段取り語）**を崩す保険を追加。
+
+実装（VPS / ritsu）
+1) /assistant/v2 の動作確認
+
+curl POST /assistant/v2 で reply_text / emotion_tag / actions / debug / should_speak が返ることを確認。
+
+/ready /health /metrics が正常（200）であることも確認。
+
+journalctl 上でも POST /assistant/v2 200 を確認。
+
+2) Phase3.5：AUTO_EMOTION v1（emotion_tag → actions queue）
+
+app.py 内に AUTO_EMOTION enqueue を追加（既存 enqueue_actions() を利用、actions_queue.py を直接呼ばない方針）。
+
+重複抑止：caller がすでに actions_in に emotion 系 action を含む場合は enqueue しない。
+
+cooldown：同一 conversation_id で同一 tag を一定時間内は抑止（AUTO_EMOTION_COOLDOWN_SEC）。
+
+hold_ms：AUTO_EMOTION_HOLD_MS を環境変数で調整可能。
+
+main 以外は対象外（monologue等を殺すガード）。
+
+/actions/next?worker_id=probe1 で type=emotion が積まれていることを確認（tag=calm 等）。
+
+3) 返信テキスト整形（TTS/会話の自然さ）
+
+delistify_to_prose() を強化：
+
+ユーザーがリスト要求でない時、箇条書きを自然文に寄せる。
+
+「まず/次に/それから/最後に」等の段取り語の連発を弱める保険を追加。
+
+「箇条書きで教えて」など、ユーザーが望む場合は抑制しない。
+
+括弧がTTSで不自然になりやすい点について：
+
+返信文側は括弧を減らす方向へ誘導済み。
+
+（必要ならPhase3.6/Phase5で speak 用テキストだけ括弧を処理する最終保険を追加可能）
+
+4) tone/micro_phrases 調整（人格の味付け）
+
+/srv/ritsu/state/memory.json の persona/tone/micro_phrases を更新し、
+
+基本敬語＋かわいげ＋少しテンション高め（ただし騒がない）に寄せる方針を反映。
+
+ack 系（ack_ok / ack_warn / ack_done / ack_sweet / ack_tsundere）を整備。
+
+サービス再起動後に反映確認（/assistant/text と /assistant/v2 の両方で tone が効いていることを確認）。
+
+動作確認ログ（要点）
+
+/assistant/v2：HTTP200、has_actions=True、actions=[speak, emotion] を確認。
+
+/actions/next：emotion がキューに載ることを確認（id/worker_id/request_id/tag/hold_ms）。
+
+ホットキー運用（本番相当）でも、サーバ側ログに /assistant/v2 のPOSTが出ていることを確認（≒V2経由で動いている）。
+
+既知の注意点（ここ重要）
+
+V2が「V1っぽく見える」理由：
+
+/assistant/v2 は内部で /assistant/text（V1）を呼んで reply_text を生成している（app.py に v1_url がある通り）。
+
+V2は reply_text に actions（speak/emotion）を“追加で”付けて返す。
+
+ただし Windows小窓UIは reply_text しか表示しないことが多いので、見た目はV1と区別がつきにくい。
+
+Phase5 でやる「仕分け」（※この部屋のメモに必ず残す）
+
+V1/V2の統合・表示仕分けを実施する：
+
+UI側：reply_text だけでなく、必要なら mode / actions / should_speak を扱う（表示・ログ・デバッグ）。
+
+まずは暫定策として、デバッグフラグON時だけ reply_text 末尾に “(v2)” を付与し、経路確認を即できるようにする（常時は付けない）。
+
+最終的には、UIがV2を前提に扱える形へ寄せて「V1に見える問題」を根絶する。
+
+
+Phase 4.6 進行メモ（この部屋の到達点 / 2026-02-09）
+要点（結論）
+
+Phase 4.6 はクリア：monologue_schedule.json が 正常ロードされ、アイドル条件で発話するところまで確認済み（idle=5秒で発火→idle=600へ戻して運用OK）。
+
+事故原因だった .env の混入（REM / set / 文字化け行） と run_ritsu_worker.cmd の overrides/secrets call を潰して、**「envはKEY=VALUEのみ」**に統一。
+
+**自動スタート（ログオン時）**は schtasks で RitsuWorker タスク作成済み。バッテリー条件も調整済み。
+
+テンプレ無しで運用継続、「キューに積む自動変換」は Phase 4.7 送りで合意。
+
+現在の構成（正）
+
+1) スケジュールJSON
+
+Path：%USERPROFILE%\.ritsu\monologue_schedule.json
+
+仕様：schema_version=monologue_schedule_v1 / timezone=Asia/Tokyo / slots=19
+
+重要：UTF-8（BOMなし）、厳密JSON（末尾カンマ・変な制御文字なし）
+
+2) 環境ファイル（KEY=VALUEのみ）
+
+Path：C:\Users\conqu\tts\.ritsu_worker.env
+
+重要：REM行 / set行は入れない（混入禁止）
+
+必須キー（値は表示不要だが存在していることが重要）
+
+RITSU_BEARER_TOKEN=...
+
+RITSU_BASE_URL=http://100.102.212.39:8181
+
+RITSU_MONOLOGUE_ENABLE=1
+
+RITSU_MONOLOGUE_SCHEDULE_ENABLE=1
+
+RITSU_MONOLOGUE_SCHEDULE_PATH=%USERPROFILE%\.ritsu\monologue_schedule.json
+
+RITSU_MONOLOGUE_STOP_FILE=%USERPROFILE%\.ritsu\monologue_stop.txt
+
+RITSU_MONOLOGUE_IDLE_SEC=600（動作確認時は一時5に変更して発火確認）
+
+3) 起動スクリプト
+
+Path：C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+変更点：overrides/secrets の call "%ENVFILE%" ブロックを無効化
+→ envがKEY=VALUEでも安全に動く
+
+4) 自動起動（ログオン時）
+
+タスク名：RitsuWorker
+
+実体：C:\Users\conqu\tts\start_ritsu_worker.cmd を起動（中で call run_ritsu_worker.cmd start）
+
+バッテリー設定：開始OK / バッテリー移行で停止しない / 利用可能なら開始（適用済み）
+
+5) ログ
+
+Dir：%LOCALAPPDATA%\RitsuWorker\
+
+例：worker_YYYYMMDD_HHMMSS.log / latest.log.txt
+
+正常サイン：
+
+[SCHED] enabled ... monologue_schedule.json slots=19 ...
+
+idle条件で [MONO] fire ... should_speak=1
+
+すぐ使う確認コマンド（最小）
+cd C:\Users\conqu\tts
+
+# 稼働
+.\run_ritsu_worker.cmd status
+.\run_ritsu_worker.cmd tail
+
+# /ready（確実版）
+try { iwr -UseBasicParsing -TimeoutSec 5 http://100.102.212.39:8181/ready | Out-Null; "OK ready" }
+catch { "NG ready: $($_.Exception.Message)" }
+
+# 自動起動タスク
+schtasks /Query /TN "RitsuWorker" /V /FO LIST
+
+注意点（再発しやすい罠）
+
+`.ritsu_worker.env は KEY=VALUE 以外を入れない（REM / set / 文字化け行が混ざると再び壊れる）
+
+monologue_stop.txt が存在すると止まるので、止めた記憶がある日はまず削除。
+
+run_ritsu_worker.cmd status の READY 表示が揺れることがあるので、/readyの try/catchを正にするのが安全。
+
+次アクション（Phase 4.7 に送ったもの）
+
+「キューに積む」→ **自動変換（テンプレ化/正規化/口調統制）**を Phase 4.7 で実装
+
+4.6の範囲では “scheduleから発話できる” がゴールなので、ここで打ち止めOK
+
+
+Phase 4.7 進行メモ（1枚）
+要点（完了判定）
+
+目的：/assistant/v2 応答後に auto_emotion / auto_speak をサーバ側で enqueue → actions DB に入り → Windows worker(GPC1) が取得して done まで処理する一連を安定化。
+
+結果：queued → running → done を request_id 単位でDB追跡でき、NameError系も解消。Phase 4.7は 完了。
+
+実装/変更点（何を直したか）
+
+ENV系定数ブロックの整理
+
+ACTIONS_DB_PATH を legacy/env両対応に統一
+
+参照順：ACTIONS_DB_PATH → RITSU_ACTIONS_DB_PATH → DEFAULT_ACTIONS_DB_PATH
+
+ENABLE_ACTIONS_ENQUEUE / ENABLE_AUTO_EMOTION / ENABLE_AUTO_SPEAK を _env_true() で統一解釈
+
+NameError解消（auto enqueue の dedup state）
+
+app.py 冒頭のENVブロックに 必ず存在する辞書として以下を追加：
+
+_AUTO_EMOTION_LAST: dict[str,int] = {}
+
+_AUTO_SPEAK_LAST: dict[str,int] = {}
+
+これにより auto_enqueue_failed: name '_AUTO_*_LAST' is not defined が消滅
+
+worker/DBの整合（実運用DBに揃える）
+
+systemd の RITSU_ACTIONS_DB_PATH=/srv/ritsu/state/actions.sqlite を利用
+
+app.ACTIONS_DB_PATH が /srv/ritsu/state/actions.sqlite を見ることを確認
+
+現在の構成（重要パス/設定）
+
+アプリ：/opt/agents/ritsu/app.py
+
+actionsキュー：/opt/agents/ritsu/actions_queue.py
+
+actions DB：/srv/ritsu/state/actions.sqlite
+
+systemd：/etc/systemd/system/ritsu.service
+
+drop-in：/etc/systemd/system/ritsu.service.d/*.conf
+
+zzzz-auto-speak.conf（AUTO_SPEAK許可/クールダウン）
+
+zz-autoemotion-v47.conf ほか（AUTO_EMOTION許可/クールダウン/許可conversation）
+
+起動（最終）：uvicorn app:app --host 0.0.0.0 --port 8181（service overrideで）
+
+ヘルス：http://127.0.0.1:8181/ready
+
+動作確認（通ったテスト）
+
+/assistant/v2 を Bearer で叩く
+
+応答JSONから request_id を取得
+
+DB（actions.sqlite）の queued_actions に (emotion,speak) の行が入り、max6秒程度で done まで遷移することを確認
+
+観測例
+
+warnings: ['auto_emotion_enqueued','auto_speak_enqueued']
+
+DB遷移：queued → running → done（両方）
+
+再現用コマンド（コマンド完結・トークン非表示）
+cd /opt/agents/ritsu || exit 1
+set -euo pipefail
+
+sudo systemctl daemon-reload
+sudo systemctl restart ritsu.service
+curl -fsS http://127.0.0.1:8181/ready ; echo
+
+PID="$(systemctl show -p MainPID --value ritsu.service | tr -d '[:space:]')"
+ENVLINES="$(tr '\0' '\n' </proc/$PID/environ)"
+TOKEN="$(printf '%s\n' "$ENVLINES" | sed -n 's/^RITSU_BEARER_TOKEN=//p' | head -n1)"
+DB="$(printf '%s\n' "$ENVLINES" | awk -F= '/^(ACTIONS_DB_PATH|RITSU_ACTIONS_DB_PATH)=/{print $2; exit}')"
+test -n "$TOKEN" && test -n "$DB" && test -f "$DB"
+
+curl -fsS -X POST "http://127.0.0.1:8181/assistant/v2" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -d '{"conversation_id":"vm","text":"DB insert check (auto speak/emotion)"}' \
+  >/tmp/v2_test.json
+
+RID="$(python3 -c 'import json; print(json.load(open("/tmp/v2_test.json"))["debug"]["request_id"])')"
+echo "RID=$RID"
+
+DB="$DB" RID="$RID" python3 - <<'PY'
+import os, time, sqlite3
+db=os.environ["DB"]; rid=os.environ["RID"]
+deadline=time.time()+6.0
+def snap():
+    con=sqlite3.connect(db); cur=con.cursor()
+    cur.execute("""
+      select action_type, state, count(*)
+      from queued_actions
+      where request_id=?
+      group by action_type, state
+      order by action_type, state
+    """,(rid,))
+    rows=cur.fetchall()
+    con.close()
+    return rows
+while True:
+    rows=snap()
+    print("rows:", rows)
+    if rows and all(state=="done" for _,state,_ in rows):
+        print("OK: all done")
+        break
+    if time.time()>deadline:
+        print("TIMEOUT: not all done yet")
+        break
+    time.sleep(0.5)
+PY
+
+注意点（リスク/反証）
+
+system python で import openai が落ちる：必ず service は venv の python/uvicorn を使う（今回ここは確認済み）。
+
+ACTIONS_DB_PATH が未設定だと、コード側がデフォルトに落ちて 別DBを見てしまう（→今回、env優先に統一して回避）。
+
+worker が高頻度ポーリングするとログ/負荷増（ログ抑制は済、負荷最適化は次フェーズ候補）。
+
+
+
+
+phase　5.1　進行メモ　
+
+VMagicMirror（VMCP）で「接続」表示は付くが、表情（BlendShape）が1mmも動かない。
+
+ritsu 側（assistant_v2 → actions → worker）は動いており、/assistant/v2 は200で返り、/actions/debug の done が増える。
+
+ritsu_worker.ps1 は [got] type=emotion tag=happy → [vmc] apply ... のログまでは出る。
+
+ここまでに判明したこと（重要）
+
+VMagicMirror の「受信元の設定：ポート」は “送信側（こちら）の送信元ポート” を指す仕様。
+こちらがランダム送信元ポートだと、VMagicMirror 側の受信元ルールに一致せず、接続が出ても適用されないことがある（＝今回の最有力原因）。
+
+実際に vmc_listen.ps1 を立てると、#bundle from=127.0.0.1:59889 のように 送信元ポートが毎回変動している兆候あり。
+
+受信元ポートを合わせるため、**送信元ポート固定（bind）**が必要。
+
+実施したこと（ログ上）
+
+ritsu_worker.ps1 の emotion→BlendShape preset を拡張、Hold（連続送信）や Apply を工夫、types の “,” prefix も修正。
+
+vmc_test.ps1 / vmc_probe.ps1 / vmc_smoke.ps1 / vmc_listen.ps1 などテストスクリプトを作成・実行。
+
+openapi.json は認証が必要（Bearerなしだと unauthorized）。
+
+途中で v1/過去タスクやプロセス混在を疑い、タスク停止・残プロセス kill を実施。
+
+スケジュールタスク一覧で関連は ritsu_worker, ritsu_tunnel, RitsuHotkey, RitsuWorker などを確認。
+
+現状の結論（次にやるべき一点）
+
+VMagicMirror 側「受信元の設定」の“ポート”を、こちらの固定送信元ポートに合わせる必要がある。
+→ こちらは UdpClient(固定SrcPort) で送る “固定送信元ポート送信” を最小構成で通すのが最短。
+
+続きで使うべきチェック観点
+
+**宛先ポート（VMagicMirrorが待受けているLocalPort）**を Get-NetUDPEndpoint で確定（例：39539 or 39549）。
+
+**送信元固定ポート（例：39550）**が空いているか確認し、VMagicMirror の受信元設定の「ポート」に同じ値を入れる。
+
+固定送信元ポートで /VMC/Ext/Blend/Val → /VMC/Ext/Blend/Apply を送る 最小テストで “まず1回動かす”。ゴール
+
+VMagicMirror（VMCP/VMC）で「接続は付くのに表情が1mmも動かない」問題を潰し、/assistant/v2 → emotion → 表情反映までE2E復旧。
+
+期待される“元の正”（プロジェクトメモ側）
+
+VMagicMirror：VMC Protocol タブで VMCP受信ON / 受信元ポート=39539 / 表情チェック、表情マップは C:\Users\conqu\tts\vmc_expr_map.json 運用、WindowsワーカーはPython常駐想定。
+
+V２開発　現在進行メモ　
+
+口パクは **TTS音量拾い（仮想マイク/マイク入力）**で成立、表情はV2で本格連動（VMC等）へ。
+
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-0…
+
+自動起動は「スタートアップ方式」寄り（タスクスケジューラは不可の前提があった）。
+
+V２開発　現在進行メモ　
+
+この部屋で確定した事実（現状）
+
+/assistant/v2 は 200で応答し、emotion_tag/actions返却は正常（PowerShellで確認）。
+
+/actions/debug で done/failed の蓄積がある（=キュー自体は動いている可能性が高い）。
+
+Windows 側は **C:\tools\ritsu\ 配下の PowerShell スクリプト群（ritsu_worker.ps1 / vmc_test.ps1 / vmc_probe.ps1 / vmc_smoke.ps1 等）**で試験を回している（プロジェクトメモの C:\Users\conqu\tts\... 構成とズレ）。
+
+VMagicMirror v4.4.0：
+
+✅「VMCPによる受信を有効化」
+
+✅ 受信元にポート設定（39539→39549へ試行）
+
+✅ 「表情」だけチェック（足腰は外した）
+
+接続表示は“繋がった”になるが、表情は変化ゼロ（Blink/Happy/aa等を送ってもダメ）。
+
+送信スクリプト側の修正・ログ
+
+OSC type tag 先頭に カンマ,必須の想定で、C:\tools\ritsu\*.ps1 を一括パッチ（, prefix付与）したが改善せず。
+
+vmc_probe.ps1 で $host が予約変数で上書き不可 → “VariableNotWritable” が大量発生（＝スクリプト内部変数名が地雷）。
+
+vmc_smoke.ps1 で UdpClient.DualMode 周りの例外が出た（PowerShell/.NET差分地雷）。
+
+混線懸念チェック
+
+関連タスクは複数見えた（例：ritsu_worker / RitsuWorker / RitsuTunnel / ritsu_tunnel 等）。同名系の二重起動・別設定起動が起きやすい状態。
+
+いま一番濃い仮説（優先順）
+
+VMagicMirror側が“受信はしてるが表情に適用していない”
+
+理由：接続表示が付く＝/VMC/Ext/OK は届いてそう、しかし Blend/Apply が無視されている可能性。
+
+“顔トラッキング/外部トラッキング”が毎フレーム上書きしていて、外部VMCのBlendが相殺
+
+受信できてても、内部トラッキング値が強制適用されると「変化ゼロ」に見える。
+
+送信仕様が微妙に違う（/Apply の引数、typetag、bundle構造、名前大小文字、など）
+
+ポート/IPv4/IPv6 の取り扱い（::1 送信や、受信元ポートの解釈違い）で “接続表示だけ成立” している
+
+次に持ち越す“切り分けの型”（迷わない順）
+
+(A) VMagicMirrorのUI操作だけで表情が動くか（＝モデル側が表情を持ってるか、上書きされてないか）
+
+(B) 顔トラッキングを完全OFFにして、VMCだけで表情が動くか（ここで動けば「上書き」確定）
+
+(C) 送信を 最小の正規VMC に寄せる（OK → Blend/Val → Apply の型を厳密化、IPv4固定、bundle/非bundle両対応）
+
+(D) Windows側の入口を整理（ritsu_worker 系タスク/プロセスの二重起動をゼロにしてから検証）
+
+
+phase　5.2　進行メモ　
+
+移行用 進行メモ（2026-02-15 JST / この部屋の到達点まとめ 1枚）
+0) 今回のゴール（最短E2E）
+
+**Windows側：音声（VOICEVOX）＋表情（VMagicMirror/VMC）**が、VPS（律 :8181）と疎通して動く状態にする
+
+V1仕様の前提：VOICEVOX（四国めたん）、起動順は boot→engine ready待ち→AHK常駐
+
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-0…
+
+1) 仕様準拠に戻した点（ずんだもん→四国めたん）
+
+V1仕様のTTS：四国めたん、プリセット基準：
+
+あまあま：speed0.98 / pitch0.00 / intonation1.20 / volume1.00
+
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-0…
+
+セクシー（基準）：speed0.92 / pitch-0.04 / intonation1.05 / volume0.95
+
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-0…
+
+ただし実運用では「セクシー強い」ので、tts_speak.py 側の sexy プリセットを“さらに控えめ”に調整して適用（最終的に「ちょうどいい」→さらに控えめ→「ちょうどいい」で着地）
+
+2) この部屋で起きてた不具合と対処
+
+音声が出ない/ログ更新が怪しい
+
+tts_speak.py のCLI引数差（--speaker_name vs --speaker-name）を踏んでいた → 呼び方を揃えて解消
+
+“回線が毎回立ち上がりまくる”問題
+
+テスト用の起動が重複して、スタートアップ/タスク/手動起動が混在しがち
+
+V2メモの推奨どおり スタートアップには「呼び出し役cmdを1つだけ」 に寄せて一本化
+
+V２開発　現在進行メモ　
+
+3) 現在の稼働確認（再起動後の状態）
+
+あなたの直近ログ上、以下は OK：
+
+Ritsu（AHK常駐）：RitsuStatus.cmd で RUNNING（AutoHotkey64.exe + tts_hotkey.ahk）
+
+VOICEVOX Engine：http://127.0.0.1:50021/speakers → 200
+
+VMagicMirror VMC受信：UDP 39539 が VMagicMirror.exe にバインド
+
+VPS readiness：http://100.102.212.39:8181/ready → {"status":"ready"}（疎通OK）
+
+4) 正本・重要ファイル（次の部屋で迷わない用）
+V1（TTS運用の正本）
+
+C:\Users\conqu\tts\tts_speak.py
+
+C:\Users\conqu\tts\tts_hotkey.ahk
+
+（V1仕様上のboot正本は tts_boot.ps1）
+
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-0…
+
+V2（Windows Worker / 表情）
+
+ワーカー：C:\Users\conqu\tts\ritsu_worker_notify.py
+
+V２開発　現在進行メモ　
+
+起動：C:\Users\conqu\tts\run_ritsu_worker.cmd
+
+V２開発　現在進行メモ　
+
+ログ：%LOCALAPPDATA%\RitsuWorker\worker_YYYYMMDD*.log
+
+V２開発　現在進行メモ　
+
+表情マップ：C:\Users\conqu\tts\vmc_expr_map.json（V2メモに記載あり）
+
+V２開発　現在進行メモ　
+
+追加で作った「運用ショートカット」（一本化のため）
+
+C:\Users\conqu\tts\RitsuStatus.cmd
+
+C:\Users\conqu\tts\RitsuStop.cmd
+
+C:\Users\conqu\tts\RitsuRestart.cmd
+
+Startup：%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\run_ritsu_worker_startup.cmd（※スタートアップは1個主義）
+
+5) すぐ使う確認コマンド（次の部屋でも同じ）
+cd C:\Users\conqu\tts
+
+# ローカル常駐状態（AHK/VOICEVOX）
+cmd /c ".\RitsuStatus.cmd"
+
+# VPS疎通（ready）
+try { (Invoke-WebRequest "http://100.102.212.39:8181/ready" -TimeoutSec 5).Content } catch { $_.Exception.Message }
+
+# workerログ最新
+$logdir="$env:LOCALAPPDATA\RitsuWorker"
+Get-ChildItem $logdir -Filter "*.log" | Sort-Object LastWriteTime -Desc | Select-Object -First 5 Name,Length,LastWriteTime
+
+6) 注意点（再発防止）
+
+PowerShellは罠が多いので PS5.1互換で固定、文字コードはUTF-8を徹底（V1仕様の「ハマりどころ」）
+
+V1仕様書（ルーム1〜5 統合版）v1.1｜2026-02-0…
+
+スタートアップ/タスク/手動起動が混ざると「回線が何度も立ち上がる」→ **スタートアップは“呼び出し役1つ”**に統一
+
+V２開発　現在進行メモ　
+
+7) 次の部屋でやること（最短）
+
+いまは安定運用の“1本化”ができたか（＝勝手に多重起動しないか）を1日様子見
+
+もし多重起動っぽさが残るなら、schtasks /Query で残タスクを洗い出して disable（削除は最後）
+
+“音声＋表情：最短”のE2Eを固定化（ワンコマンド化）して、運用ショートを完成させる
+
+次のチャット部屋 冒頭コピペ（再開用）
+
+「Windows側のRitsu常駐（AHK+VOICEVOX+VMagicMirror/VMC）をスタートアップ1本に統一済み。C:\Users\conqu\tts\RitsuStatus.cmd で RUNNING、VOICEVOX /speakers 200、VMC UDP39539はVMagicMirrorにバインド、VPS http://100.102.212.39:8181/ready
+ は {"status":"ready"}。
+残課題：多重起動（回線が立ち上がりまくる）兆候が完全に消えたか監視し、残ってたらschtasks/Startup残骸を整理して最終固定化したい。ログは %LOCALAPPDATA%\RitsuWorker と latest.log。」
+
+
+([Past chat][1])([Past chat][1])([Past chat][1])([Past chat][1])
+
+# 進行メモ（Phase5.3-3 / 2026-02-22 JST）※次チャット貼り付け用1枚
+
+## 目的（この部屋のゴール）
+
+Windows（AHKホットキー＋小窓/PTT）→ `ritsu_send_to_file.ps1`（SSHトンネル経由）→ VPS ritsu(:8181) → `reply_text.txt / reply_ptt.txt` → VOICEVOXで発声、までを**安定稼働**させる。
+
+---
+
+## 結果（いま動いている：OK）
+
+### ✅ PTTフル経路が成立（実際に喋った）
+
+`ptt_process.log` が以下の成功系列で終わる：
+
+* `WAV_OK`
+* `STT_START model=tiny`
+* `STT_OK text_len=...`
+* `SEND_START`
+* `SEND_OK reply_ptt_updated`
+* `SPEAK_START`
+* `SPEAK_SPAWN pid=...`
+* `DONE`
+
+### ✅ 小窓（テキスト送信）も稼働
+
+小窓から送信→律応答が表示される（テキスト疎通OK）。
+
+### ✅ トンネル前提が確定
+
+* Windows 側URL：`%USERPROFILE%\.ritsu\ritsu_url.txt = http://127.0.0.1:18181`
+* トンネル：`18181 -> VPS 127.0.0.1:8181`
+* Token：`%USERPROFILE%\.ritsu\ritsu_token.txt`（len=64、末尾 `_dvl`）
+
+### ✅ ritsu API（VPS側）到達・認証が成立
+
+Windows curl/PowerShell経由で `POST /assistant/v2` が200で返るルートを確認済み（Authorization: Bearer）。
+
+---
+
+## 主要な修正点（この部屋で直したこと）
+
+### 1) PowerShell 5.1 罠：`Test-Path $x -and Test-Path $y` が壊れる問題
+
+* `ptt_process.ps1` 内に残っていた
+  `if(Test-Path $speak -and Test-Path $ReplyPtt) {`
+  を **PS5.1安全形**へ修正：
+* 現状は少なくとも
+  `if ((Test-Path $speak) -and (Test-Path $ReplyPtt)) {`
+  まで到達（ここで “and” 起因のSPEAK_FAILを潰した）
+
+### 2) `SEND_START` で止まる（senderが戻らない）問題 → タイムアウト＆ログ化で解決
+
+`ptt_process.ps1` の sender 実行を **Start-Process + Wait-Process -Timeout 30** に置換し、
+
+* `%LOCALAPPDATA%\RitsuWorker\sender_cmd.out.log`
+* `%LOCALAPPDATA%\RitsuWorker\sender_cmd.err.log`
+  を出すようにした。これでハングしても止まらず、切り分け可能になった。
+
+### 3) PTTの後処理を stop 側にフックして自動実行
+
+* `ptt_stop.ps1` に `PTT_PROCESS_HOOK` を入れて、stop後に `ptt_process.ps1` が走る構成へ。
+* STT結果→sender→reply_ptt更新→VOICEVOX speak の流れが安定。
+
+### 4) 音声認識負荷を軽量化（安定優先）
+
+* `RITSU_WHISPER_MODEL=tiny`
+* `RITSU_LANG=ja`
+* `vad_filter=False`（空振れ対策で切った流れがあった）
+* HF Hubの「未認証」警告は出たが、動作自体は成立（token無しでも回る）
+
+---
+
+## 現在の重要ファイル（Windows）
+
+### 作業ディレクトリ
+
+* `C:\Users\conqu\tts\`
+
+### AHK（常駐）
+
+* `C:\Users\conqu\tts\tts_hotkey.ahk`
+* 役割（最終イメージ）
+
+  * `XButton1`：小窓トグル
+  * `XButton2`：PTT（押下=開始 / 離す=停止）
+
+### PTT系
+
+* `C:\Users\conqu\tts\ptt_start.ps1`
+* `C:\Users\conqu\tts\ptt_stop.ps1`（stop後に ptt_process を呼ぶフックあり）
+* `C:\Users\conqu\tts\ptt_process.ps1`（STT→sender→reply→speak）
+
+### sender（テキスト送信）
+
+* `C:\Users\conqu\tts\ritsu_sender.cmd`
+* `C:\Users\conqu\tts\ritsu_send_to_file.ps1`
+
+  * 送信先：`/assistant/v2` 優先（トンネルURLを読む）
+  * 認証：Bearer（必要なら x-api-key 併用の実装が残っていてもOK）
+
+### VOICEVOX
+
+* `C:\Users\conqu\tts\voicevox_speak.ps1`
+* Engine：`http://127.0.0.1:50021`（200 OK）
+
+### 状態ディレクトリ（ログ/成果物）
+
+* `%LOCALAPPDATA%\RitsuWorker\`
+
+  * `ptt.wav`
+  * `ptt_text.txt`
+  * `reply_ptt.txt`
+  * `ptt_process.log`
+  * `sender_cmd.out.log / sender_cmd.err.log`
+  * `voicevox_speak.out.log / voicevox_speak.err.log / voicevox_speak.spawn.err.log`
+  * `ptt_process.lock`（残るとLOCK_SKIP）
+
+---
+
+## Quick Check（コピペ一発）
+
+```powershell
+cd C:\Users\conqu\tts
+$st="$env:LOCALAPPDATA\RitsuWorker"
+
+# トンネル/VOICEVOX/ritsu
+try{(iwr http://127.0.0.1:18181/ready -UseBasicParsing -TimeoutSec 3).StatusCode}catch{$_.Exception.Message}
+try{(iwr http://127.0.0.1:50021/speakers -UseBasicParsing -TimeoutSec 3).StatusCode}catch{$_.Exception.Message}
+
+# 直近の成功ログ
+Get-Content -Tail 80 (Join-Path $st "ptt_process.log") -ErrorAction SilentlyContinue
+```
+
+---
+
+## 復旧（詰まったらこれ）
+
+```powershell
+cd C:\Users\conqu\tts
+$st="$env:LOCALAPPDATA\RitsuWorker"
+
+# ptt_process残骸kill
+Get-CimInstance Win32_Process | ? { $_.CommandLine -match 'ptt_process\.ps1' } | % { try{Stop-Process -Id $_.ProcessId -Force}catch{} }
+
+# lock掃除
+Remove-Item (Join-Path $st "ptt_process.lock") -Force -ErrorAction SilentlyContinue
+"OK reset"
+```
+
+---
+
+## 未完（Phase5.3 残タスク）
+
+1. **独り言（auto_emotion × タイマーリンク）**の実装箇所特定＆安定化（多重起動ガード含む）
+2. 小窓/PTTの「最終キーバインド」整理（既存割当の衝突ゼロ化、コメント整備）
+3. logs/lock の整理（必要最小ログ、lock残留時の自動回復）
+
+---
+
+## 現在の結論
+
+この部屋で **Phase5.3の核心（小窓＋PTT→律→発声）を実運用レベルで通した**。
+次チャットは「独り言」と「多重起動ガード/掃除」の仕上げに入れる状態。
+
+[1]: https://chatgpt.com/c/694c7aca-2648-8323-9a96-41f5b9353ee0 "仕込み銘柄選定"
+
