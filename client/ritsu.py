@@ -285,19 +285,21 @@ class VMCClient:
 # ---------------------------------------------------------------------------
 class TTSEngine:
     PRESETS = {
-        "amaama": {"speed": 0.98, "pitch": 0.00, "intonation": 1.20, "volume": 1.00},
-        "sexy":   {"speed": 1.03, "pitch": 0.00, "intonation": 1.02, "volume": 0.95},
+        "amaama": {"speed": 0.98, "pitch": 0.00, "intonation": 1.20, "volume": 1.00, "style_id": 0},
+        "sexy":   {"speed": 1.03, "pitch": 0.00, "intonation": 1.02, "volume": 0.95, "style_id": 4},
     }
-    SEXY_WORDS = ("ねえ", "だよ", "かな", "お願い", "だめ", "すき", "好き", "おはよ", "おやすみ")
+    SEXY_WORDS = ("\u306d\u3048", "\u3060\u3088", "\u304b\u306a", "\u304a\u9858\u3044",
+                  "\u3060\u3081", "\u3059\u304d", "\u597d\u304d", "\u304a\u306f\u3088",
+                  "\u304a\u3084\u3059\u307f")  # ねえ,だよ,かな,お願い,だめ,すき,好き,おはよ,おやすみ
 
     def __init__(self, base_url: str = "http://127.0.0.1:50021",
-                 speaker_name: str = "四国めたん"):
+                 speaker_name: str = "",
+                 default_style_id: int = 0):
         self.base = base_url
-        self.speaker_name = speaker_name
+        self.default_style_id = default_style_id
         self._queue: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="tts")
         self._thread.start()
-        self._style_cache: dict = {}
 
     def speak(self, text: str) -> None:
         if text.strip():
@@ -315,12 +317,8 @@ class TTSEngine:
                 for chunk, pause in chunks:
                     style = "sexy" if self._is_sexy(chunk) else "amaama"
                     preset = self.PRESETS[style]
-                    style_name = "セクシー" if style == "sexy" else "あまあま"
-                    sid = self._resolve_style(style_name)
-                    log(f"[TTS] style={style_name} sid={sid}")
-                    if sid is None:
-                        log(f"[TTS] SKIP: could not resolve style '{style_name}'")
-                        continue
+                    sid = preset["style_id"]
+                    log(f"[TTS] chunk='{chunk[:30]}' style={style} sid={sid}")
                     # audio_query
                     q = urllib.parse.urlencode({"text": chunk, "speaker": sid})
                     req = urllib.request.Request(
@@ -346,37 +344,6 @@ class TTSEngine:
                     time.sleep(pause)
             except Exception as e:
                 log(f"[TTS] error: {e}")
-
-    def _resolve_style(self, style_name: str) -> Optional[int]:
-        cache_key = f"{self.speaker_name}/{style_name}"
-        if cache_key in self._style_cache:
-            return self._style_cache[cache_key]
-        try:
-            import urllib.request
-            raw = urllib.request.urlopen(f"{self.base}/speakers", timeout=3).read()
-            speakers = json.loads(raw.decode("utf-8"))
-            for sp in speakers:
-                sp_name = sp.get("name", "")
-                if sp_name == self.speaker_name or self.speaker_name in sp_name:
-                    log(f"[TTS] found speaker: {sp_name}")
-                    for st in sp.get("styles", []):
-                        st_name = st.get("name", "")
-                        log(f"[TTS]   style: '{st_name}' id={st.get('id')}")
-                        if st_name == style_name:
-                            sid = int(st["id"])
-                            self._style_cache[cache_key] = sid
-                            log(f"[TTS]   MATCH: {style_name} → {sid}")
-                            return sid
-                    # Fallback: first style
-                    if sp.get("styles"):
-                        sid = int(sp["styles"][0]["id"])
-                        self._style_cache[cache_key] = sid
-                        log(f"[TTS]   fallback to first style: {sid}")
-                        return sid
-            log(f"[TTS] speaker '{self.speaker_name}' not found in {len(speakers)} speakers")
-        except Exception as e:
-            log(f"[TTS] speaker resolve EXCEPTION: {e}")
-        return None
 
     def _is_sexy(self, text: str) -> bool:
         t = text.strip()
@@ -900,10 +867,10 @@ def main():
                            str(script_dir / "vmc_expr_map.json")),
     )
 
-    # TTS
+    # TTS (style IDs: 四国めたん あまあま=0, セクシー=4)
     tts = TTSEngine(
         base_url=_env("VOICEVOX_URL", "http://127.0.0.1:50021"),
-        speaker_name=_env("RITSU_VOICEVOX_SPEAKER_NAME", "四国めたん"),
+        default_style_id=_env_int("RITSU_VOICEVOX_STYLE_ID", 0),
     )
 
     # STT + PTT
