@@ -10,7 +10,7 @@ Architecture:
        ↕ Queue
   [API Thread]      → VPS :8181 (HTTP direct)
   [Worker Thread]   → Action polling → VMC/TTS/Notify
-  [Monologue Thread]→ Idle detect → /assistant/v2
+  [Monologue Thread]→ Idle detect + Schedule → /assistant/v2 or fixed text
   [Tunnel Thread]   → SSH tunnel management
   [TTS Thread]      → VOICEVOX synthesis + playback
 """
@@ -123,11 +123,13 @@ class SSHTunnel:
     """SSH tunnel: localhost:local_port → remote:remote_port"""
 
     def __init__(self, ssh_host: str, local_port: int = 18181,
-                 remote_port: int = 8181, ssh_port: int = 22):
+                 remote_port: int = 8181, ssh_port: int = 22,
+                 ssh_key_path: str = ""):
         self.ssh_host = ssh_host
         self.local_port = local_port
         self.remote_port = remote_port
         self.ssh_port = ssh_port
+        self.ssh_key_path = ssh_key_path
         self._proc: Optional[subprocess.Popen] = None
         self._stop = threading.Event()
 
@@ -153,8 +155,10 @@ class SSHTunnel:
             "-o", "TCPKeepAlive=yes",
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=no",
-            self.ssh_host,
         ]
+        if self.ssh_key_path and os.path.exists(self.ssh_key_path):
+            args.extend(["-i", self.ssh_key_path])
+        args.append(self.ssh_host)
         while not self._stop.is_set():
             log(f"[TUNNEL] connecting {self.ssh_host}:{self.ssh_port} → localhost:{self.local_port}")
             try:
@@ -251,6 +255,9 @@ class VMCClient:
         self._lock = threading.Lock()
         self._client = None
         self.expr_map: dict = {}
+        self._active_expr: Optional[tuple[str, float]] = None  # (blendshape, value)
+        self._expr_fade_cancel = threading.Event()
+        self._speaking_event: Optional[threading.Event] = None  # ref to tts.speaking
         self._load_map(expr_map_path)
 
     def _ensure_client(self):
@@ -258,6 +265,8 @@ class VMCClient:
             try:
                 from pythonosc.udp_client import SimpleUDPClient
                 self._client = SimpleUDPClient(self.host, self.port)
+                self._client.send_message("/VMC/Ext/OK", [1])
+                log(f"[VMC] connected {self.host}:{self.port}")
             except ImportError:
                 log("[VMC] pythonosc not installed")
                 return None
@@ -272,33 +281,129 @@ class VMCClient:
         for k in ("neutral", "happy", "sad", "angry", "surprised", "calm", "warn", "think", "sorry"):
             self.expr_map.setdefault(k, self.expr_map.get(k, ""))
 
+    # ----- send_expression ------------------------------------------------
+
     def send_expression(self, tag: str, value: float = 1.0,
-                        hold_ms: int = 900, fade_ms: int = 0) -> None:
+                        hold_ms: int = 2000, fade_ms: int = 400) -> None:
+        """Register expression BlendShape.
+
+        If TTS is currently playing, only stores the value in _active_expr
+        (clamped to min 0.8) so the lipsync thread can bundle it with
+        mouth-A in one Apply.
+        If TTS is NOT playing, sends Val+Apply immediately (value=1.0)
+        and schedules a hold→fade cycle (hold_ms=2000ms).
+        """
+        bs = self.expr_map.get(tag, "")
+        speaking = bool(self._speaking_event and self._speaking_event.is_set())
+
+        if not bs:
+            log(f"[VMC] expression: tag={tag} bs=UNKNOWN val={value} speaking={speaking} -> SKIPPED (no mapping)")
+            return
+
+        # Cancel any pending standalone fade
+        self._expr_fade_cancel.set()
+
+        # If TTS is active, lipsync thread will include this in its Apply
+        if speaking:
+            # Clamp expression value to min 0.8 during TTS for visibility
+            tts_value = max(float(value), 0.8)
+            self._active_expr = (bs, tts_value)
+            log(f"[VMC] expression: tag={tag} bs={bs} val={value}->{tts_value} speaking=True hold=deferred (lipsync will send)")
+            return
+
+        # Standalone: ensure full expression strength
+        standalone_value = max(float(value), 1.0)
+        self._active_expr = (bs, standalone_value)
+        log(f"[VMC] expression: tag={tag} bs={bs} val={value}->{standalone_value} speaking=False hold={hold_ms}ms fade={fade_ms}ms (standalone)")
+
+        cancel = threading.Event()
+        self._expr_fade_cancel = cancel
+        threading.Thread(target=self._standalone_expr,
+                         args=(bs, standalone_value, hold_ms, fade_ms, cancel),
+                         daemon=True, name="vmc-expr").start()
+
+    def _standalone_expr(self, bs: str, value: float,
+                         hold_ms: int, fade_ms: int,
+                         cancel: threading.Event) -> None:
+        """Standalone expression: send immediately, hold, then fade."""
         c = self._ensure_client()
         if not c:
             return
-        name = self.expr_map.get(tag.lower(), "")
-        if not name:
+        try:
+            with self._lock:
+                c.send_message("/VMC/Ext/OK", [1])
+                c.send_message("/VMC/Ext/Blend/Val", [bs, float(value)])
+                c.send_message("/VMC/Ext/Blend/Apply", [])
+            log(f"[VMC] standalone apply: bs={bs} val={value} hold={hold_ms}ms fade={fade_ms}ms")
+
+            # Hold
+            if cancel.wait(hold_ms / 1000.0):
+                log(f"[VMC] standalone cancelled during hold: bs={bs}")
+                return
+
+            # Fade
+            if fade_ms > 0:
+                steps = max(int(fade_ms / 33), 1)
+                for i in range(steps):
+                    if cancel.is_set():
+                        return
+                    frac = 1.0 - (i + 1) / steps
+                    with self._lock:
+                        c.send_message("/VMC/Ext/OK", [1])
+                        c.send_message("/VMC/Ext/Blend/Val",
+                                       [bs, float(value * frac)])
+                        c.send_message("/VMC/Ext/Blend/Apply", [])
+                    time.sleep(0.033)
+
+            # Final reset
+            with self._lock:
+                c.send_message("/VMC/Ext/OK", [1])
+                c.send_message("/VMC/Ext/Blend/Val", [bs, 0.0])
+                c.send_message("/VMC/Ext/Blend/Apply", [])
+
+            # Clear if still ours
+            if self._active_expr and self._active_expr[0] == bs:
+                self._active_expr = None
+                log(f"[VMC] standalone fade done, cleared {bs}")
+        except Exception as e:
+            log(f"[VMC] standalone expr error: {e}")
+
+    # ----- lip sync (called ~30 fps from TTS thread) ----------------------
+
+    def send_lipsync(self, a_value: float) -> None:
+        """Send mouth-A + active expression BlendShape in one Apply."""
+        c = self._ensure_client()
+        if not c:
+            log("[LIPSYNC] send_lipsync: no client!")
             return
         try:
             with self._lock:
-                c.send_message("/VMC/Ext/Blend/Val", [name, float(value)])
+                c.send_message("/VMC/Ext/OK", [1])
+                c.send_message("/VMC/Ext/Blend/Val", ["A", float(a_value)])
+                expr = self._active_expr
+                if expr:
+                    c.send_message("/VMC/Ext/Blend/Val",
+                                   [expr[0], float(expr[1])])
                 c.send_message("/VMC/Ext/Blend/Apply", [])
-            time.sleep(max(hold_ms, 0) / 1000.0)
-            if fade_ms > 0:
-                steps = 5
-                for i in range(steps - 1, -1, -1):
-                    v = value * (i / max(steps - 1, 1))
-                    with self._lock:
-                        c.send_message("/VMC/Ext/Blend/Val", [name, float(v)])
-                        c.send_message("/VMC/Ext/Blend/Apply", [])
-                    time.sleep(fade_ms / 1000.0 / steps)
-            else:
-                with self._lock:
-                    c.send_message("/VMC/Ext/Blend/Val", [name, 0.0])
-                    c.send_message("/VMC/Ext/Blend/Apply", [])
-        except Exception as e:
-            log(f"[VMC] send failed: {e}")
+        except Exception as exc:
+            log(f"[LIPSYNC] send_lipsync error: {exc}")
+
+    def reset_lipsync(self) -> None:
+        """Close mouth (A=0), preserving active expression."""
+        c = self._ensure_client()
+        if not c:
+            return
+        try:
+            with self._lock:
+                c.send_message("/VMC/Ext/OK", [1])
+                c.send_message("/VMC/Ext/Blend/Val", ["A", 0.0])
+                expr = self._active_expr
+                if expr:
+                    c.send_message("/VMC/Ext/Blend/Val",
+                                   [expr[0], float(expr[1])])
+                c.send_message("/VMC/Ext/Blend/Apply", [])
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # TTS (VOICEVOX)
@@ -317,9 +422,189 @@ class TTSEngine:
                  default_style_id: int = 0):
         self.base = base_url
         self.default_style_id = default_style_id
+        self.speaking = threading.Event()  # set while audio is playing
+        self._vmc: Optional[Any] = None  # VMCClient ref for lip sync
         self._queue: queue.Queue = queue.Queue()
+        self._cable_idx, self._speaker_idx = self._discover_output_devices()
         self._thread = threading.Thread(target=self._worker, daemon=True, name="tts")
         self._thread.start()
+
+    def _discover_output_devices(self) -> tuple[Optional[int], Optional[int]]:
+        """Discover CABLE Input and speaker device indices.
+
+        Returns (cable_idx, speaker_idx).  Both use MME (hostapi 0) because
+        MME's OutputStream.write() blocks until playback completes, which
+        keeps chunk sequencing correct.
+        """
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            cable_idx: Optional[int] = None
+            speaker_idx: Optional[int] = None
+
+            # Find CABLE Input (MME)
+            for i, d in enumerate(devices):
+                if ("cable input" in d["name"].lower()
+                        and d["max_output_channels"] > 0
+                        and d.get("hostapi", -1) == 0):
+                    cable_idx = i
+                    log(f"[TTS] Found CABLE Input: [{i}] {d['name']}")
+                    break
+
+            # Speaker: default output if it is NOT a CABLE device
+            try:
+                def_out = int(sd.default.device[1])
+                if def_out >= 0:
+                    d = devices[def_out]
+                    if ("cable" not in d["name"].lower()
+                            and d["max_output_channels"] > 0):
+                        speaker_idx = def_out
+                        log(f"[TTS] Speaker (default): [{def_out}] {d['name']}")
+            except Exception:
+                pass
+
+            # If default IS cable, find first non-CABLE MME output
+            if speaker_idx is None:
+                for i, d in enumerate(devices):
+                    if (d["max_output_channels"] > 0
+                            and d.get("hostapi", -1) == 0
+                            and "cable" not in d["name"].lower()
+                            and "vb-audio" not in d["name"].lower()
+                            and i != cable_idx):
+                        speaker_idx = i
+                        log(f"[TTS] Speaker (fallback): [{i}] {d['name']}")
+                        break
+
+            if cable_idx is None:
+                log("[TTS] CABLE Input not found")
+            if speaker_idx is None:
+                log("[TTS] Speaker not found, will use winsound fallback")
+            return cable_idx, speaker_idx
+        except Exception as e:
+            log(f"[TTS] Device discovery failed: {e}")
+            return None, None
+
+    def _play_wav(self, wav_bytes: bytes) -> None:
+        """Play WAV on speaker + CABLE Input, with VMC lip sync.
+
+        Both audio devices are addressed by explicit index.
+        A parallel lip-sync thread analyses RMS volume per 33 ms frame
+        and sends mouth-A BlendShape to VMagicMirror via VMC protocol.
+        """
+        targets = [i for i in (self._cable_idx, self._speaker_idx)
+                    if i is not None]
+
+        if not targets:
+            tmp = Path(os.environ.get("TEMP", ".")) / "ritsu_tts_out.wav"
+            tmp.write_bytes(wav_bytes)
+            import winsound
+            log("[TTS] _play_wav: winsound fallback")
+            winsound.PlaySound(str(tmp), winsound.SND_FILENAME)
+            return
+
+        import io, wave
+        import numpy as np
+        import sounddevice as sd
+
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            rate = wf.getframerate()
+            ch = wf.getnchannels()
+            raw = wf.readframes(wf.getnframes())
+        audio_f = (np.frombuffer(raw, dtype="int16")
+                     .reshape(-1, ch)
+                     .astype(np.float32) / 32768.0)
+        duration = len(audio_f) / rate
+        log(f"[TTS] _play_wav: {rate}Hz {ch}ch {duration:.1f}s → {targets}")
+
+        # --- Pre-compute lip sync RMS per frame (~30 fps) ----------------
+        lip_values: list[float] = []
+        vmc = self._vmc
+        if vmc is not None:
+            frame_ms = 33          # ~30 fps
+            frame_sz = max(int(rate * frame_ms / 1000), 1)
+            # mono mix for RMS
+            mono = audio_f.mean(axis=1) if ch > 1 else audio_f[:, 0]
+            rms_list: list[float] = []
+            for i in range(0, len(mono), frame_sz):
+                chunk = mono[i:i + frame_sz]
+                rms_list.append(float(np.sqrt(np.mean(chunk ** 2))))
+            rms_peak = max(rms_list) if rms_list else 0.01
+            threshold = 0.015
+            log(f"[LIPSYNC] pre-compute: {len(rms_list)} frames, "
+                f"frame_sz={frame_sz}, rms_peak={rms_peak:.4f}, thr={threshold}")
+            # Map RMS → mouth A (0.0-1.0) with smoothing
+            prev = 0.0
+            smooth_up = 0.55   # fast open
+            smooth_down = 0.35 # slower close (natural)
+            for rms in rms_list:
+                if rms < threshold:
+                    target = 0.0
+                else:
+                    target = min((rms / rms_peak) * 1.2, 1.0)
+                alpha = smooth_up if target > prev else smooth_down
+                val = prev + alpha * (target - prev)
+                lip_values.append(round(val, 3))
+                prev = val
+            nonzero = sum(1 for v in lip_values if v > 0.01)
+            log(f"[LIPSYNC] lip_values: {len(lip_values)} total, "
+                f"{nonzero} nonzero, "
+                f"first5={lip_values[:5]}, last5={lip_values[-5:]}")
+        else:
+            log("[LIPSYNC] vmc is None — lip sync disabled")
+
+        # --- Lip sync sender thread --------------------------------------
+        def _lipsync_sender() -> None:
+            frame_interval = 0.033
+            total = len(lip_values)
+            log(f"[LIPSYNC] sender START: {total} frames, interval={frame_interval}s")
+            t0 = time.time()
+            sent = 0
+            try:
+                for idx, val in enumerate(lip_values):
+                    target_time = t0 + idx * frame_interval
+                    wait = target_time - time.time()
+                    if wait > 0:
+                        time.sleep(wait)
+                    vmc.send_lipsync(val)
+                    sent += 1
+                    if idx < 5 or idx % 10 == 0 or idx == total - 1:
+                        log(f"[LIPSYNC] frame {idx}/{total} A={val:.3f} "
+                            f"t={time.time()-t0:.2f}s")
+            except Exception as exc:
+                log(f"[LIPSYNC] sender ERROR at frame {sent}: {exc}")
+            elapsed = time.time() - t0
+            log(f"[LIPSYNC] sender END: sent {sent}/{total} in {elapsed:.2f}s")
+            vmc.reset_lipsync()
+
+        # --- Audio playback per device ------------------------------------
+        def _play_single(dev_idx: int) -> None:
+            try:
+                dev_name = sd.query_devices(dev_idx)["name"]
+                log(f"[TTS] play start: [{dev_idx}] {dev_name}")
+                t0 = time.time()
+                with sd.OutputStream(samplerate=rate, channels=ch,
+                                     dtype="float32", device=dev_idx) as stream:
+                    stream.write(audio_f)
+                elapsed = time.time() - t0
+                remaining = duration - elapsed
+                if remaining > 0.05:
+                    time.sleep(remaining)
+                log(f"[TTS] play done:  [{dev_idx}] ({time.time()-t0:.1f}s)")
+            except Exception as exc:
+                log(f"[TTS] play error: [{dev_idx}] {exc}")
+
+        # --- Launch all threads simultaneously ----------------------------
+        threads: list[threading.Thread] = []
+        if lip_values:
+            threads.append(threading.Thread(target=_lipsync_sender,
+                                            daemon=True, name="lipsync"))
+        for d in targets:
+            threads.append(threading.Thread(target=_play_single, args=(d,),
+                                            daemon=True))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     def speak(self, text: str) -> None:
         if text.strip():
@@ -331,6 +616,7 @@ class TTSEngine:
         while True:
             text = self._queue.get()
             try:
+                self.speaking.set()
                 chunks = self._split(text)
                 for chunk, pause in chunks:
                     style = "sexy" if self._is_sexy(chunk) else "amaama"
@@ -352,14 +638,13 @@ class TTSEngine:
                         data=body, headers={"Content-Type": "application/json"},
                         method="POST")
                     wav = urllib.request.urlopen(req2, timeout=60).read()
-                    # play
-                    tmp = Path(os.environ.get("TEMP", ".")) / "ritsu_tts_out.wav"
-                    tmp.write_bytes(wav)
-                    import winsound
-                    winsound.PlaySound(str(tmp), winsound.SND_FILENAME)
+                    # play on configured output devices
+                    self._play_wav(wav)
                     time.sleep(pause)
             except Exception as e:
                 log(f"[TTS] error: {e}")
+            finally:
+                self.speaking.clear()
 
     def _is_sexy(self, text: str) -> bool:
         # Disabled by default. Set RITSU_TTS_SEXY=1 to enable.
@@ -559,9 +844,10 @@ class WorkerThread(threading.Thread):
             notify("律", str(text))
         elif t in ("emotion", "vmc_expression"):
             tag = payload.get("tag") or payload.get("emotion_tag", "neutral")
-            hold = int(payload.get("hold_ms", 900))
-            fade = int(payload.get("fade_ms", 0))
-            self.vmc.send_expression(tag, hold_ms=hold, fade_ms=fade)
+            val = float(payload.get("value", 1.0))
+            log(f"[WORKER] dispatch emotion: type={t} tag={tag} val={val} payload={payload}")
+            self.vmc.send_expression(tag, value=val)
+            log(f"[WORKER] send_expression returned: tag={tag} val={val}")
         elif t == "speak":
             text = payload.get("text") or payload.get("reply_text") or payload.get("message", "")
             if text:
@@ -572,7 +858,7 @@ class WorkerThread(threading.Thread):
             log(f"[WORKER] skip type={t}")
 
 # ---------------------------------------------------------------------------
-# Monologue Thread
+# Monologue Thread (idle検知 + スケジュール定時発話 統合)
 # ---------------------------------------------------------------------------
 class MonologueThread(threading.Thread):
     def __init__(self, api: RitsuAPI, vmc: VMCClient, tts: TTSEngine):
@@ -581,8 +867,39 @@ class MonologueThread(threading.Thread):
         self.vmc = vmc
         self.tts = tts
 
+    # --- Schedule loader ---
+    @staticmethod
+    def _load_schedule(path: str) -> list[dict]:
+        """monologue_schedule.json を読み込み、slotsリストを返す"""
+        try:
+            p = Path(path)
+            if not p.exists():
+                log(f"[MONO-SCH] schedule file not found: {path}")
+                return []
+            data = json.loads(p.read_text(encoding="utf-8"))
+            slots = data.get("slots", [])
+            log(f"[MONO-SCH] loaded {len(slots)} slots from {path}")
+            return slots
+        except Exception as e:
+            log(f"[MONO-SCH] load error: {e}")
+            return []
+
+    # --- Time range check ---
+    @staticmethod
+    def _in_time_range(now_t, time_range: str) -> bool:
+        try:
+            s, e = time_range.split("-")
+            sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
+            st, et = dtime(sh, sm), dtime(eh, em)
+            if st <= et:
+                return st <= now_t <= et
+            else:
+                return now_t >= st or now_t <= et
+        except:
+            return True  # パース失敗時は制限なし
+
     def run(self):
-        enable = _env_bool("RITSU_MONOLOGUE_ENABLE", False)
+        # --- Idle mode config ---
         idle_need = _env_int("RITSU_MONOLOGUE_IDLE_SEC", 600)
         cooldown = _env_int("RITSU_MONOLOGUE_COOLDOWN_SEC", 900)
         max_day = _env_int("RITSU_MONOLOGUE_MAX_PER_DAY", 20)
@@ -590,50 +907,86 @@ class MonologueThread(threading.Thread):
         tick = _env_int("RITSU_MONOLOGUE_TICK_SEC", 5)
         conv_id = _env("RITSU_MONOLOGUE_CONVERSATION_ID", "monologue")
 
-        count = 0
-        last_fire = 0.0
-        log(f"[MONO] start enable={enable} idle={idle_need}s cooldown={cooldown}s")
+        # --- Schedule config ---
+        schedule_enable = _env_bool("RITSU_MONOLOGUE_SCHEDULE_ENABLE", False)
+        schedule_path = _env("RITSU_MONOLOGUE_SCHEDULE_PATH", "monologue_schedule.json")
+        schedule_tolerance = _env_int("RITSU_MONOLOGUE_SCHEDULE_TOLERANCE_SEC", 120)
+        slots = self._load_schedule(schedule_path) if schedule_enable else []
+
+        # --- State ---
+        idle_count = 0
+        idle_last_fire = 0.0
+        fired_slots: set[str] = set()  # "HH:MM" 当日発火済み
+        last_date = datetime.now().date()
+
+        log(f"[MONO] start idle_enable={_env_bool('RITSU_MONOLOGUE_ENABLE', False)} "
+            f"idle={idle_need}s cooldown={cooldown}s "
+            f"schedule_enable={schedule_enable} slots={len(slots)}")
 
         while True:
             try:
-                if not _env_bool("RITSU_MONOLOGUE_ENABLE", False):
-                    time.sleep(tick); continue
-                idle = get_idle_seconds()
                 now_dt = datetime.now()
-                if idle < idle_need:
-                    time.sleep(tick); continue
-                if cooldown > 0 and (time.time() - last_fire) < cooldown:
-                    time.sleep(tick); continue
-                if max_day >= 0 and count >= max_day:
-                    time.sleep(tick); continue
-                # Time range check
-                try:
-                    s, e = time_range.split("-")
-                    sh, sm = map(int, s.split(":")); eh, em = map(int, e.split(":"))
-                    t = now_dt.time()
-                    st, et = dtime(sh, sm), dtime(eh, em)
-                    if st <= et:
-                        if not (st <= t <= et): time.sleep(tick); continue
-                    else:
-                        if not (t >= st or t <= et): time.sleep(tick); continue
-                except: pass
+                now_t = now_dt.time()
 
-                title = get_foreground_title()
-                prompt = (
-                    f"【独り言モード】\n- 現在時刻: {now_dt.strftime('%H:%M')}\n"
-                    f"- 無操作: {idle}秒\n- アクティブウィンドウ: {title[:80]}\n\n"
-                    "短く1〜2文。作業の邪魔にならないトーンで。"
-                )
-                data = self.api.send_v2(prompt, conv_id)
-                reply = data.get("reply_text", "")
-                tag = data.get("emotion_tag", "neutral")
-                if reply:
-                    notify("律（独り言）", reply)
-                    self.tts.speak(reply)
-                    self.vmc.send_expression(tag, hold_ms=900, fade_ms=700)
-                last_fire = time.time()
-                count += 1
-                log(f"[MONO] fired #{count}: {reply[:60]}")
+                # 日付変更 → スケジュール発火履歴リセット
+                if now_dt.date() != last_date:
+                    fired_slots.clear()
+                    idle_count = 0
+                    last_date = now_dt.date()
+                    log("[MONO] new day -> reset counters")
+
+                # ======================
+                # Schedule型 (定時発話)
+                # ======================
+                if schedule_enable and _env_bool("RITSU_MONOLOGUE_SCHEDULE_ENABLE", False):
+                    for slot in slots:
+                        at_str = slot.get("at", "")
+                        if at_str in fired_slots:
+                            continue
+                        try:
+                            sh, sm = map(int, at_str.split(":"))
+                            # 現在時刻がスケジュール時刻から tolerance 秒以内か
+                            sched_secs = sh * 3600 + sm * 60
+                            now_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+                            diff = now_secs - sched_secs
+                            if 0 <= diff <= schedule_tolerance:
+                                text = slot.get("text", "")
+                                tag = slot.get("emotion_tag", "neutral")
+                                if text:
+                                    log(f"[MONO-SCH] firing slot {at_str}: {text[:40]}")
+                                    notify("律（定時）", text)
+                                    self.tts.speak(text)
+                                    self.vmc.send_expression(tag, hold_ms=900, fade_ms=700)
+                                fired_slots.add(at_str)
+                        except Exception as e:
+                            log(f"[MONO-SCH] slot parse error {at_str}: {e}")
+
+                # ======================
+                # Idle型 (無操作検知)
+                # ======================
+                if _env_bool("RITSU_MONOLOGUE_ENABLE", False):
+                    idle = get_idle_seconds()
+                    if (idle >= idle_need
+                            and (cooldown <= 0 or (time.time() - idle_last_fire) >= cooldown)
+                            and (max_day < 0 or idle_count < max_day)
+                            and self._in_time_range(now_t, time_range)):
+                        title = get_foreground_title()
+                        prompt = (
+                            f"【独り言モード】\n- 現在時刻: {now_dt.strftime('%H:%M')}\n"
+                            f"- 無操作: {idle}秒\n- アクティブウィンドウ: {title[:80]}\n\n"
+                            "短く1〜2文。作業の邪魔にならないトーンで。"
+                        )
+                        data = self.api.send_v2(prompt, conv_id)
+                        reply = data.get("reply_text", "")
+                        tag = data.get("emotion_tag", "neutral")
+                        if reply:
+                            notify("律（独り言）", reply)
+                            self.tts.speak(reply)
+                            self.vmc.send_expression(tag, hold_ms=900, fade_ms=700)
+                        idle_last_fire = time.time()
+                        idle_count += 1
+                        log(f"[MONO] idle fired #{idle_count}: {reply[:60]}")
+
                 time.sleep(tick)
             except Exception as e:
                 log(f"[MONO] error: {e}")
@@ -965,6 +1318,7 @@ def main():
             local_port=_env_int("RITSU_SSH_LOCAL_PORT", 18181),
             remote_port=_env_int("RITSU_SSH_REMOTE_PORT", 8181),
             ssh_port=_env_int("RITSU_SSH_PORT", 22),
+            ssh_key_path=_env("RITSU_SSH_KEY_PATH", ""),
         )
         tunnel.start()
         time.sleep(2)  # Wait for tunnel
@@ -986,6 +1340,8 @@ def main():
         base_url=_env("VOICEVOX_URL", "http://127.0.0.1:50021"),
         default_style_id=_env_int("RITSU_VOICEVOX_STYLE_ID", 0),
     )
+    tts._vmc = vmc  # VMC lip sync from TTS
+    vmc._speaking_event = tts.speaking  # expression defers to lipsync when TTS active
 
     # STT + PTT
     stt = STTEngine()
