@@ -738,21 +738,23 @@ def main():
                          d['default_samplerate'], marker)
         log.info("Set RITSU_STT_INPUT_DEVICE=<number> in .env to change input device")
 
-        # Quick mic test (0.5s recording)
-        try:
-            default_idx = sd.default.device[0]
-            dev = sd.query_devices(default_idx)
-            test_rate = int(dev['default_samplerate'])
-            log.info("Testing mic (device #%d, rate=%d)...", default_idx, test_rate)
-            test_audio = sd.rec(int(test_rate * 0.5), samplerate=test_rate,
-                                channels=1, dtype="int16", device=default_idx)
-            sd.wait()
-            import numpy as np
-            peak = np.max(np.abs(test_audio))
-            log.info("Mic test: peak=%d (0=silent, 32767=max). %s",
-                     peak, "OK" if peak > 100 else "WARNING: very quiet or silent!")
-        except Exception as e:
-            log.warning("Mic test failed: %s", e)
+        # Quick mic test (0.5s recording) — in background to not block GUI
+        def _mic_test():
+            try:
+                default_idx = sd.default.device[0]
+                dev = sd.query_devices(default_idx)
+                test_rate = int(dev['default_samplerate'])
+                log.info("Testing mic (device #%d, rate=%d)...", default_idx, test_rate)
+                test_audio = sd.rec(int(test_rate * 0.5), samplerate=test_rate,
+                                    channels=1, dtype="int16", device=default_idx)
+                sd.wait()
+                import numpy as np
+                peak = np.max(np.abs(test_audio))
+                log.info("Mic test: peak=%d (0=silent, 32767=max). %s",
+                         peak, "OK" if peak > 100 else "WARNING: very quiet or silent!")
+            except Exception as e:
+                log.warning("Mic test failed: %s", e)
+        threading.Thread(target=_mic_test, daemon=True).start()
     except Exception as e:
         log.warning("Could not list audio devices: %s", e)
 
