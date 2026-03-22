@@ -348,7 +348,16 @@ def run_gui():
     root.after(100, lambda: append_log(
         f"[{PERSONA_NAME}] V4起動完了。テキスト入力で会話できます。"))
 
-    entry.focus_set()
+    # Force focus on entry (topmost windows on Windows often lose keyboard focus)
+    def _force_focus():
+        root.lift()
+        root.focus_force()
+        entry.focus_set()
+    root.after(300, _force_focus)
+
+    # Click anywhere on window → focus entry
+    root.bind("<Button-1>", lambda e: entry.focus_set())
+
     root.mainloop()
 
 # ---------------------------------------------------------------------------
