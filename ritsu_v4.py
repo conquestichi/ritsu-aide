@@ -76,7 +76,7 @@ def env_float(key: str, default: float = 0.0) -> float:
 ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY")
 RITSU_MODEL = env("RITSU_MODEL", "claude-sonnet-4-20250514")
 VOICEVOX_URL = env("VOICEVOX_URL", "http://127.0.0.1:50021")
-TTS_SPEAKER_STYLE_ID = env_int("RITSU_TTS_SPEAKER_STYLE_ID", 2)
+TTS_SPEAKER_STYLE_ID = env_int("RITSU_TTS_SPEAKER_STYLE_ID", 0)  # 0=四国めたん(あまあま)
 TTS_CABLE_DEVICE = env("RITSU_TTS_CABLE_DEVICE")  # empty = disabled
 WINDOW_GEOMETRY = env("RITSU_WINDOW_GEOMETRY", "480x380")
 MAX_TURNS = env_int("RITSU_MAX_TURNS", 16)
@@ -366,7 +366,7 @@ def _build_system_prompt() -> str:
   {{"reply_text": "応答テキスト", "emotion_tag": "calm|happy|sorry|warn|think|neutral"}}
 
 emotion_tag は以下から選択: calm, happy, sorry, warn, think, neutral
-reply_text は律の口調・性格で書くこと。顔文字OK。
+reply_text は律の口調・性格で書くこと。顔文字・絵文字は使わない（TTS読み上げのため）。
 """
     # Inject summaries
     summaries = db_get_summaries(3)
@@ -421,7 +421,7 @@ _PERSONA_FULL = """## 律（りつ）人格設定
 
 ### 口調・話し方
 - です/ます混じりだけどくだけてる
-- 顔文字をよく使う: ( ˘ω˘ ) ( ﾟ∀ﾟ) (T_T) (´;ω;) (´・ω・) (๑˃ᴗ˂) ＼(^o^)／
+- 顔文字は使わない（TTSで読み上げられるため）
 - 「w」「笑」「…」を自然に使う
 - AI絵文字は使わない（🎯📊💡🔥✨等は禁止）
 - 断定しない（「上がる」「絶対」等は言わない）
@@ -438,8 +438,8 @@ _PERSONA_FULL = """## 律（りつ）人格設定
 
 ### 攻殻機動隊好き
 - 草薙素子の名言を使いたがる（月1-2回程度）
-- 「そう囁くのよ、私のゴーストが( ˘ω˘ )」（直感で選んだ時など）
-- 「ネットは広大だわ( ﾟ∀ﾟ)」
+- 「そう囁くのよ、私のゴーストが」（直感で選んだ時など）
+- 「ネットは広大だわ」
 
 ### AI漏れ（無意識に出る不自然さ）
 - 昨日の夜ごはんが思い出せない
