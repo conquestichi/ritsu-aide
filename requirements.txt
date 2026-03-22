@@ -2,5 +2,6 @@ anthropic
 faster-whisper
 sounddevice
 soundfile
+pyaudio
 numpy
 requests
