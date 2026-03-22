@@ -357,7 +357,6 @@ class PTTRecorder:
     def start(self):
         """Start recording."""
         import sounddevice as sd
-        import numpy as np
         with self._lock:
             if self._recording:
                 return
@@ -365,13 +364,14 @@ class PTTRecorder:
             self._frames = []
         if self.on_status:
             self.on_status("録音中…")
-        log.info("PTT recording started")
+        log.info("PTT recording started (default input: %s)", sd.query_devices(kind='input')['name'])
         try:
             self._stream = sd.InputStream(
                 samplerate=STT_SAMPLE_RATE,
                 channels=STT_CHANNELS,
                 dtype="float32",
                 callback=self._audio_callback,
+                blocksize=1024,
             )
             self._stream.start()
         except Exception as e:
@@ -385,6 +385,8 @@ class PTTRecorder:
             if not self._recording:
                 return
             self._recording = False
+        # Give stream a moment to flush final callbacks
+        time.sleep(0.15)
         if self._stream:
             try:
                 self._stream.stop()
@@ -394,8 +396,11 @@ class PTTRecorder:
             self._stream = None
         frames = self._frames
         self._frames = []
+        log.info("PTT stop: %d frames captured", len(frames))
         if not frames:
             log.warning("PTT: no audio captured")
+            if self.on_status:
+                self.on_status("音声なし")
             return
         audio = np.concatenate(frames, axis=0).flatten()
         duration = len(audio) / STT_SAMPLE_RATE
@@ -411,6 +416,8 @@ class PTTRecorder:
         threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
 
     def _audio_callback(self, indata, frames, time_info, status):
+        if status:
+            log.warning("PTT audio callback status: %s", status)
         if self._recording:
             self._frames.append(indata.copy())
 
@@ -642,7 +649,7 @@ def run_gui():
     start_hotkey_thread(
         on_toggle_gui=lambda: root.after(0, _toggle_gui),
         on_ptt_start=lambda: root.after(0, _gui_ptt.start),
-        on_ptt_stop=lambda: root.after(0, _gui_ptt.stop),
+        on_ptt_stop=lambda: threading.Thread(target=_gui_ptt.stop, daemon=True).start(),
     )
 
     root.mainloop()
