@@ -383,7 +383,7 @@ class PTTRecorder:
         self._stop_event.set()
 
     def _record_and_process(self):
-        """Single thread: record → wait for stop → transcribe."""
+        """Record in 0.5s chunks using sd.rec()+sd.wait() — same as working mic test."""
         try:
             import sounddevice as sd
             import numpy as np
@@ -398,38 +398,31 @@ class PTTRecorder:
             dev_idx = input_dev if input_dev is not None else sd.default.device[0]
             dev_info = sd.query_devices(dev_idx)
             rate = int(dev_info['default_samplerate'])
-            max_seconds = 30
+            chunk_sec = 0.5
+            chunk_frames = int(rate * chunk_sec)
 
             log.info("PTT recording started (device #%s: %s, rate=%d)",
                      dev_idx, dev_info['name'], rate)
 
-            max_frames = int(rate * max_seconds)
-            # Start recording (same thread will also stop it)
-            audio = sd.rec(max_frames, samplerate=rate,
-                           channels=1, dtype="int16", device=dev_idx)
-
-            # Wait for stop signal
+            chunks = []
             while not self._stop_event.is_set():
-                time.sleep(0.05)
+                chunk = sd.rec(chunk_frames, samplerate=rate,
+                               channels=1, dtype="int16", device=dev_idx)
+                sd.wait()
+                chunks.append(chunk.copy())
 
-            # Stop from SAME thread that started
-            sd.stop()
             self._recording = False
 
-            # Trim trailing zeros
-            flat = audio.flatten()
-            nonzero = np.nonzero(flat)[0]
-            if len(nonzero) == 0:
-                log.warning("PTT: completely silent recording")
+            if not chunks:
+                log.warning("PTT: no chunks")
                 if self.on_status:
-                    self.on_status("無音")
+                    self.on_status("音声なし")
                 return
 
-            last = nonzero[-1]
-            trimmed = flat[:last + 1]
-            duration = len(trimmed) / rate
-            peak = int(np.max(np.abs(trimmed)))
-            log.info("PTT: %.1fs audio (peak=%d)", duration, peak)
+            audio = np.concatenate(chunks, axis=0).flatten()
+            duration = len(audio) / rate
+            peak = int(np.max(np.abs(audio)))
+            log.info("PTT: %.1fs audio (%d chunks, peak=%d)", duration, len(chunks), peak)
 
             if duration < 0.3:
                 log.warning("PTT: too short")
@@ -442,7 +435,7 @@ class PTTRecorder:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(rate)
-                wf.writeframes(trimmed.tobytes())
+                wf.writeframes(audio.tobytes())
 
             if self.on_status:
                 self.on_status("認識中…")
