@@ -48,6 +48,10 @@ def load_dotenv(path: str = ".env"):
         # strip surrounding quotes
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
             val = val[1:-1]
+        else:
+            # strip inline comments (only for unquoted values)
+            if " #" in val:
+                val = val[:val.index(" #")].strip()
         os.environ.setdefault(key, val)
 
 load_dotenv()
@@ -529,32 +533,6 @@ def start_hotkey_thread(on_toggle_gui=None, on_ptt_start=None, on_ptt_stop=None)
     t = threading.Thread(target=_hotkey_thread, daemon=True, name="Hotkey")
     t.start()
     return t
-
-# ---------------------------------------------------------------------------
-# 7. Chat handler (combines Claude + TTS)
-# ---------------------------------------------------------------------------
-
-def handle_user_input(text: str, log_callback=None):
-    """Process user input: call Claude, log result, speak reply."""
-    text = text.strip()
-    if not text:
-        return
-
-    if log_callback:
-        log_callback(f"[{PERSONA_CALL_USER}] {text}")
-
-    result = _call_claude(text)
-    reply = result["reply_text"]
-    emotion = result["emotion_tag"]
-    elapsed = result.get("elapsed", 0)
-
-    tag = f" [{emotion}]" if emotion != "neutral" else ""
-    time_str = f" ({elapsed:.1f}s)" if elapsed else ""
-
-    if log_callback:
-        log_callback(f"[{PERSONA_NAME}]{tag}{time_str} {reply}")
-
-    tts_speak(reply)
 
 # ---------------------------------------------------------------------------
 # 10. tkinter GUI
