@@ -358,33 +358,31 @@ def stt_transcribe_file(wav_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 class PTTRecorder:
-    """V3 exact pattern: soundfile + sd.InputStream + callback + rate=16000."""
+    """PTT: XButton2 press shows 'ready', release triggers fixed-duration recording.
+    sd.rec()+sd.wait() is the ONLY pattern that works on DualSense."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
         self.on_status = on_status
-        self._recording = False
-        self._stop_event = threading.Event()
-        self._wav_path = str(Path(os.environ.get("TEMP", ".")) / "ritsu_ptt.wav")
+        self._armed = False
 
     def start(self):
-        if self._recording:
-            return
-        self._recording = True
-        self._stop_event.clear()
+        """Arm PTT (button pressed)."""
+        self._armed = True
         if self.on_status:
-            self.on_status("録音中…")
-        threading.Thread(target=self._record, daemon=True).start()
-        log.info("PTT recording started")
+            self.on_status("🎙 話してください…離すと録音開始")
+        log.info("PTT armed")
 
     def stop(self):
-        if not self._recording:
+        """Button released — record fixed duration now."""
+        if not self._armed:
             return
-        self._stop_event.set()
-        self._recording = False
+        self._armed = False
+        if self.on_status:
+            self.on_status("録音中(3秒)…")
+        threading.Thread(target=self._record_and_transcribe, daemon=True).start()
 
-    def _record(self):
-        """Use sd.rec() (async) + poll stop + sd.stop(). InputStream callback doesn't work on DualSense."""
+    def _record_and_transcribe(self):
         try:
             import sounddevice as sd
             import numpy as np
@@ -398,56 +396,39 @@ class PTTRecorder:
             dev_idx = input_dev if input_dev is not None else sd.default.device[0]
             dev_info = sd.query_devices(dev_idx)
             rate = int(dev_info['default_samplerate'])
-            max_seconds = 30
-            max_frames = int(rate * max_seconds)
+            rec_seconds = 3
+            frames = int(rate * rec_seconds)
 
-            log.info("PTT: sd.rec() on device #%d (%s) at %dHz", dev_idx, dev_info['name'], rate)
+            log.info("PTT: recording %ds on device #%d (%s) at %dHz",
+                     rec_seconds, dev_idx, dev_info['name'], rate)
 
-            # sd.rec() starts async recording into pre-allocated array
-            audio = sd.rec(max_frames, samplerate=rate, channels=1,
+            audio = sd.rec(frames, samplerate=rate, channels=1,
                            dtype="int16", device=dev_idx)
+            sd.wait()  # block until recording complete
 
-            # Poll until stop signal
-            while not self._stop_event.is_set():
-                time.sleep(0.05)
+            peak = int(np.max(np.abs(audio)))
+            log.info("PTT: recorded %ds, peak=%d", rec_seconds, peak)
 
-            # Stop recording (same thread as sd.rec)
-            sd.stop()
-
-            # Find how much audio was actually recorded
-            flat = audio.flatten()
-            nonzero_idx = np.nonzero(flat)[0]
-            if len(nonzero_idx) == 0:
-                log.warning("PTT: no audio data (all zeros)")
+            if peak < 50:
+                log.warning("PTT: silent")
                 if self.on_status:
                     self.on_status("無音")
                 return
 
-            recorded = flat[:nonzero_idx[-1] + 1]
-            duration = len(recorded) / rate
-            peak = int(np.max(np.abs(recorded)))
-            log.info("PTT: %.1fs audio (peak=%d, rate=%d)", duration, peak, rate)
-
-            if duration < 0.3 or peak < 50:
-                log.warning("PTT: too short or silent")
-                if self.on_status:
-                    self.on_status("短すぎます")
-                return
-
             # Write WAV
-            with wave.open(self._wav_path, "wb") as wf:
+            wav_path = str(Path(os.environ.get("TEMP", ".")) / "ritsu_ptt.wav")
+            flat = audio.flatten()
+            with wave.open(wav_path, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(rate)
-                wf.writeframes(recorded.tobytes())
+                wf.writeframes(flat.tobytes())
 
-            fsize = os.path.getsize(self._wav_path)
-            log.info("PTT: WAV written %d bytes", fsize)
+            log.info("PTT: WAV %d bytes", os.path.getsize(wav_path))
 
-            # Transcribe
             if self.on_status:
                 self.on_status("認識中…")
-            text = stt_transcribe_file(self._wav_path)
+            text = stt_transcribe_file(wav_path)
             if text and not text.startswith("("):
                 log.info("PTT transcribed: %s", text)
                 if self.on_status:
@@ -459,7 +440,7 @@ class PTTRecorder:
                 if self.on_status:
                     self.on_status("認識失敗")
         except Exception as e:
-            log.error("PTT record error: %s", e)
+            log.error("PTT error: %s", e)
             if self.on_status:
                 self.on_status(f"エラー: {e}")
 
