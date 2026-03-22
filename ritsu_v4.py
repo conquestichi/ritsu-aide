@@ -318,7 +318,7 @@ def run_gui():
     input_frame.pack(fill=tk.X, padx=4, pady=4)
 
     entry = tk.Entry(input_frame, font=("Meiryo UI", 10), bg="#3c3c3c", fg="#d4d4d4",
-                     insertbackground="#d4d4d4", relief=tk.FLAT)
+                     insertbackground="#d4d4d4", relief=tk.FLAT, takefocus=True)
     entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
 
     def append_log(msg: str):
@@ -359,6 +359,22 @@ def run_gui():
 
     # Click anywhere on window → focus entry
     root.bind("<Button-1>", lambda e: root.after(10, entry.focus_force))
+
+    # DEBUG: log key events to console to diagnose input issues
+    def _debug_key(e):
+        print(f"[DEBUG] Key event on ROOT: keysym={e.keysym} char={repr(e.char)} widget={e.widget}")
+    root.bind("<Key>", _debug_key)
+
+    def _debug_entry_key(e):
+        print(f"[DEBUG] Key event on ENTRY: keysym={e.keysym} char={repr(e.char)} state={e.state}")
+    entry.bind("<Key>", _debug_entry_key, add="+")
+
+    def _debug_focus(e):
+        print(f"[DEBUG] FocusIn: widget={e.widget} class={e.widget.winfo_class()}")
+    root.bind("<FocusIn>", _debug_focus, add="+")
+
+    print(f"[DEBUG] entry.winfo_class()={entry.winfo_class()} takefocus={entry.cget('takefocus')}")
+    print(f"[DEBUG] entry state={entry.cget('state')}")
 
     root.mainloop()
 
