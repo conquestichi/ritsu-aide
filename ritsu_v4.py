@@ -408,27 +408,15 @@ class PTTRecorder:
                      dev_idx, dev_info['name'], rate)
 
             chunks: list = []
-            q: queue.Queue = queue.Queue()
 
-            def callback(indata, frames, time_info, status):
-                if status:
-                    log.warning("PTT audio status: %s", status)
-                q.put(indata.copy())
-
-            stream_kwargs = dict(
-                samplerate=rate, channels=1, dtype="int16",
-                callback=callback, blocksize=4096,
-            )
-            if input_dev is not None:
-                stream_kwargs["device"] = input_dev
-
-            with sd.InputStream(**stream_kwargs):
+            with sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                                blocksize=4096, device=input_dev) as stream:
+                log.info("PTT InputStream opened, reading...")
                 while not self._stop_event.is_set():
-                    try:
-                        data = q.get(timeout=0.2)
-                        chunks.append(data)
-                    except Exception:
-                        continue
+                    data, overflowed = stream.read(4096)
+                    if overflowed:
+                        log.warning("PTT: audio overflow")
+                    chunks.append(data.copy())
 
             self._recording = False
             log.info("PTT stop: %d chunks captured", len(chunks))
