@@ -304,9 +304,9 @@ def run_gui():
 
     root = tk.Tk()
     root.title(f"{PERSONA_NAME} Aide V4")
-    geo = WINDOW_GEOMETRY
-    root.geometry(geo)
-    # topmost is set AFTER focus acquisition to avoid UIPI focus steal issues
+    root.geometry(WINDOW_GEOMETRY)
+    root.configure(bg="#2d2d2d")
+
     # --- Log area ---
     log_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, state=tk.DISABLED,
                                           font=("Meiryo UI", 9), bg="#1e1e1e", fg="#d4d4d4",
@@ -317,9 +317,11 @@ def run_gui():
     input_frame = tk.Frame(root, bg="#2d2d2d")
     input_frame.pack(fill=tk.X, padx=4, pady=4)
 
-    entry = tk.Entry(input_frame, font=("Meiryo UI", 10), bg="#3c3c3c", fg="#d4d4d4",
-                     insertbackground="#d4d4d4", relief=tk.FLAT, takefocus=True)
-    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+    # Use Text(height=1) instead of Entry — better IME support on Japanese Windows
+    entry = tk.Text(input_frame, font=("Meiryo UI", 10), bg="#3c3c3c", fg="#d4d4d4",
+                    insertbackground="#d4d4d4", relief=tk.FLAT, height=1, wrap=tk.NONE,
+                    undo=True)
+    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=2)
 
     def append_log(msg: str):
         log_area.config(state=tk.NORMAL)
@@ -327,14 +329,21 @@ def run_gui():
         log_area.see(tk.END)
         log_area.config(state=tk.DISABLED)
 
+    def get_entry_text() -> str:
+        return entry.get("1.0", tk.END).strip()
+
+    def clear_entry():
+        entry.delete("1.0", tk.END)
+
     def on_send(event=None):
-        text = entry.get().strip()
+        text = get_entry_text()
         if not text:
-            return
-        entry.delete(0, tk.END)
+            return "break"
+        clear_entry()
         threading.Thread(target=handle_user_input,
                          args=(text, lambda m: root.after(0, append_log, m)),
                          daemon=True).start()
+        return "break"  # prevent newline insertion
 
     entry.bind("<Return>", on_send)
 
@@ -347,7 +356,7 @@ def run_gui():
     root.after(100, lambda: append_log(
         f"[{PERSONA_NAME}] V4起動完了。テキスト入力で会話できます。"))
 
-    # Force focus on entry (topmost windows on Windows often lose keyboard focus)
+    # Focus
     def _force_focus():
         root.deiconify()
         root.lift()
@@ -355,26 +364,9 @@ def run_gui():
         entry.focus_force()
         root.attributes("-topmost", True)
     root.after(300, _force_focus)
-    root.after(600, lambda: entry.focus_force())
 
-    # Click anywhere on window → focus entry
+    # Click anywhere → focus entry
     root.bind("<Button-1>", lambda e: root.after(10, entry.focus_force))
-
-    # DEBUG: log key events to console to diagnose input issues
-    def _debug_key(e):
-        print(f"[DEBUG] Key event on ROOT: keysym={e.keysym} char={repr(e.char)} widget={e.widget}")
-    root.bind("<Key>", _debug_key)
-
-    def _debug_entry_key(e):
-        print(f"[DEBUG] Key event on ENTRY: keysym={e.keysym} char={repr(e.char)} state={e.state}")
-    entry.bind("<Key>", _debug_entry_key, add="+")
-
-    def _debug_focus(e):
-        print(f"[DEBUG] FocusIn: widget={e.widget} class={e.widget.winfo_class()}")
-    root.bind("<FocusIn>", _debug_focus, add="+")
-
-    print(f"[DEBUG] entry.winfo_class()={entry.winfo_class()} takefocus={entry.cget('takefocus')}")
-    print(f"[DEBUG] entry state={entry.cget('state')}")
 
     root.mainloop()
 
