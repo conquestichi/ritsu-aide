@@ -391,8 +391,6 @@ class PTTRecorder:
             import sounddevice as sd
             import numpy as np
 
-            rate = STT_SAMPLE_RATE
-
             # Determine input device
             input_dev = None
             if STT_INPUT_DEVICE:
@@ -401,9 +399,13 @@ class PTTRecorder:
                 except ValueError:
                     input_dev = None
 
-            dev_info = sd.query_devices(input_dev if input_dev is not None else sd.default.device[0])
-            log.info("PTT recording started (device #%s: %s, rate: %d)",
-                     input_dev if input_dev is not None else "default", dev_info['name'], rate)
+            dev_idx = input_dev if input_dev is not None else sd.default.device[0]
+            dev_info = sd.query_devices(dev_idx)
+            # Use device's native sample rate (some devices reject 16kHz)
+            native_rate = int(dev_info['default_samplerate'])
+            rate = native_rate
+            log.info("PTT recording started (device #%s: %s, native_rate=%d)",
+                     dev_idx, dev_info['name'], rate)
 
             chunks: list = []
             q: queue.Queue = queue.Queue()
@@ -413,9 +415,14 @@ class PTTRecorder:
                     log.warning("PTT audio status: %s", status)
                 q.put(indata.copy())
 
-            with sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                callback=callback, blocksize=4096,
-                                device=input_dev):
+            stream_kwargs = dict(
+                samplerate=rate, channels=1, dtype="int16",
+                callback=callback, blocksize=4096,
+            )
+            if input_dev is not None:
+                stream_kwargs["device"] = input_dev
+
+            with sd.InputStream(**stream_kwargs):
                 while not self._stop_event.is_set():
                     try:
                         data = q.get(timeout=0.2)
@@ -730,6 +737,22 @@ def main():
                          i, d['name'], d['max_input_channels'],
                          d['default_samplerate'], marker)
         log.info("Set RITSU_STT_INPUT_DEVICE=<number> in .env to change input device")
+
+        # Quick mic test (0.5s recording)
+        try:
+            default_idx = sd.default.device[0]
+            dev = sd.query_devices(default_idx)
+            test_rate = int(dev['default_samplerate'])
+            log.info("Testing mic (device #%d, rate=%d)...", default_idx, test_rate)
+            test_audio = sd.rec(int(test_rate * 0.5), samplerate=test_rate,
+                                channels=1, dtype="int16", device=default_idx)
+            sd.wait()
+            import numpy as np
+            peak = np.max(np.abs(test_audio))
+            log.info("Mic test: peak=%d (0=silent, 32767=max). %s",
+                     peak, "OK" if peak > 100 else "WARNING: very quiet or silent!")
+        except Exception as e:
+            log.warning("Mic test failed: %s", e)
     except Exception as e:
         log.warning("Could not list audio devices: %s", e)
 
