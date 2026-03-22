@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""律 Aide V4 — Windows完結・API最小・1ファイル常駐AIアシスタント (Phase 1+2)"""
+"""律 Aide V4 — Windows完結・API最小・1ファイル常駐AIアシスタント (Phase 1-3)"""
 
 import ctypes
 import ctypes.wintypes
@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import socket
+import sqlite3
 import struct
 import sys
 import threading
@@ -18,6 +19,7 @@ import traceback
 import wave
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # 0. Logging
@@ -80,6 +82,11 @@ WINDOW_GEOMETRY = env("RITSU_WINDOW_GEOMETRY", "480x380")
 MAX_TURNS = env_int("RITSU_MAX_TURNS", 16)
 CONVERSATION_ID = env("RITSU_CONVERSATION_ID", "default")
 
+# Memory
+DB_PATH = env("RITSU_DB_PATH", "ritsu.sqlite")
+SUMMARIZE_EVERY = env_int("RITSU_SUMMARIZE_EVERY", 8)
+MAX_KNOWLEDGE = env_int("RITSU_MAX_KNOWLEDGE", 200)
+
 # STT (faster-whisper)
 STT_MODEL = env("RITSU_STT_MODEL", "small")
 STT_DEVICE = env("RITSU_STT_DEVICE", "auto")  # auto/cuda/cpu
@@ -113,14 +120,241 @@ if not acquire_singleton():
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# 4. Persona & system prompt
+# 4. Memory — SQLite (turns, summaries, knowledge)
 # ---------------------------------------------------------------------------
 
-PERSONA_NAME = "律"
-PERSONA_CALL_USER = "司令官"
-PERSONA_TONE = "基本は落ち着いたプロ。短く結論から。癒し少し、ツンデレ軽め、たまにドジ要素。"
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
-SYSTEM_PROMPT = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AIアシスタント。
+def _db_init():
+    """Create tables if not exist."""
+    conn = _db_connect()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            emotion_tag TEXT DEFAULT 'neutral',
+            ts INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            turn_start INTEGER NOT NULL,
+            turn_end INTEGER NOT NULL,
+            turn_count INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS knowledge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL DEFAULT 'fact',
+            content TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'auto',
+            confidence REAL NOT NULL DEFAULT 0.8,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """)
+    conn.close()
+    log.info("Memory DB initialized: %s", DB_PATH)
+
+_db_init()
+_db_lock = threading.Lock()
+
+def db_save_turn(role: str, content: str, emotion_tag: str = "neutral"):
+    """Save a conversation turn."""
+    ts = int(time.time())
+    with _db_lock:
+        conn = _db_connect()
+        conn.execute("INSERT INTO turns (conversation_id, role, content, emotion_tag, ts) VALUES (?,?,?,?,?)",
+                     (CONVERSATION_ID, role, content, emotion_tag, ts))
+        conn.commit()
+        conn.close()
+
+def db_get_recent_turns(n: int = 20) -> list[dict]:
+    """Get recent turns for context."""
+    with _db_lock:
+        conn = _db_connect()
+        rows = conn.execute(
+            "SELECT role, content, emotion_tag FROM turns WHERE conversation_id=? ORDER BY ts DESC LIMIT ?",
+            (CONVERSATION_ID, n)).fetchall()
+        conn.close()
+    return [{"role": r[0], "content": r[1], "emotion": r[2]} for r in reversed(rows)]
+
+def db_get_turn_count() -> int:
+    with _db_lock:
+        conn = _db_connect()
+        count = conn.execute("SELECT COUNT(*) FROM turns WHERE conversation_id=?",
+                             (CONVERSATION_ID,)).fetchone()[0]
+        conn.close()
+    return count
+
+def db_get_last_summary_turn_end() -> int:
+    """Get the turn_end of the last summary."""
+    with _db_lock:
+        conn = _db_connect()
+        row = conn.execute("SELECT MAX(turn_end) FROM summaries WHERE conversation_id=?",
+                           (CONVERSATION_ID,)).fetchone()
+        conn.close()
+    return row[0] if row and row[0] else 0
+
+def db_save_summary(summary: str, turn_start: int, turn_end: int, turn_count: int):
+    ts = int(time.time())
+    with _db_lock:
+        conn = _db_connect()
+        conn.execute("INSERT INTO summaries (conversation_id, summary, turn_start, turn_end, turn_count, created_at) VALUES (?,?,?,?,?,?)",
+                     (CONVERSATION_ID, summary, turn_start, turn_end, turn_count, ts))
+        conn.commit()
+        conn.close()
+    log.info("Summary saved (turns %d-%d)", turn_start, turn_end)
+
+def db_get_summaries(limit: int = 5) -> list[str]:
+    with _db_lock:
+        conn = _db_connect()
+        rows = conn.execute(
+            "SELECT summary FROM summaries WHERE conversation_id=? ORDER BY created_at DESC LIMIT ?",
+            (CONVERSATION_ID, limit)).fetchall()
+        conn.close()
+    return [r[0] for r in reversed(rows)]
+
+def db_save_knowledge(content: str, category: str = "fact", source: str = "auto", confidence: float = 0.8):
+    ts = int(time.time())
+    with _db_lock:
+        conn = _db_connect()
+        # Check duplicate
+        existing = conn.execute("SELECT id FROM knowledge WHERE content=? AND is_active=1", (content,)).fetchone()
+        if existing:
+            conn.close()
+            return
+        # Enforce max
+        count = conn.execute("SELECT COUNT(*) FROM knowledge WHERE is_active=1").fetchone()[0]
+        if count >= MAX_KNOWLEDGE:
+            conn.execute("DELETE FROM knowledge WHERE id = (SELECT id FROM knowledge WHERE is_active=1 ORDER BY updated_at ASC LIMIT 1)")
+        conn.execute("INSERT INTO knowledge (category, content, source, confidence, is_active, created_at, updated_at) VALUES (?,?,?,?,1,?,?)",
+                     (category, content, source, confidence, ts, ts))
+        conn.commit()
+        conn.close()
+    log.info("Knowledge saved: [%s] %s", category, content[:50])
+
+def db_get_knowledge(limit: int = 50) -> list[dict]:
+    with _db_lock:
+        conn = _db_connect()
+        rows = conn.execute(
+            "SELECT id, category, content, confidence FROM knowledge WHERE is_active=1 ORDER BY updated_at DESC LIMIT ?",
+            (limit,)).fetchall()
+        conn.close()
+    return [{"id": r[0], "category": r[1], "content": r[2], "confidence": r[3]} for r in rows]
+
+def db_deactivate_knowledge(content_match: str) -> int:
+    """Deactivate knowledge matching content (partial match). Returns count."""
+    ts = int(time.time())
+    with _db_lock:
+        conn = _db_connect()
+        cur = conn.execute("UPDATE knowledge SET is_active=0, updated_at=? WHERE is_active=1 AND content LIKE ?",
+                           (ts, f"%{content_match}%"))
+        conn.commit()
+        count = cur.rowcount
+        conn.close()
+    return count
+
+# --- Auto-summarize & knowledge extraction (background) ---
+
+def _auto_summarize_if_needed():
+    """Check if we need to summarize and do it in background."""
+    try:
+        last_end = db_get_last_summary_turn_end()
+        total = db_get_turn_count()
+        unsummarized = total - last_end
+        if unsummarized >= SUMMARIZE_EVERY * 2:  # pairs
+            threading.Thread(target=_run_summarize, args=(last_end, total), daemon=True).start()
+    except Exception as e:
+        log.error("Auto-summarize check error: %s", e)
+
+def _run_summarize(turn_start: int, turn_end: int):
+    """Generate summary using Claude API."""
+    try:
+        import anthropic
+        turns = db_get_recent_turns(SUMMARIZE_EVERY * 2)
+        if not turns:
+            return
+        turns_text = "\n".join(f"{t['role']}: {t['content']}" for t in turns[-SUMMARIZE_EVERY*2:])
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = client.messages.create(
+            model=RITSU_MODEL,
+            max_tokens=512,
+            system="会話を簡潔に要約してください。重要な事実・決定・感情の変化を含めてください。日本語で。",
+            messages=[{"role": "user", "content": f"以下の会話を要約:\n{turns_text}"}],
+        )
+        summary = resp.content[0].text.strip()
+        db_save_summary(summary, turn_start, turn_end, turn_end - turn_start)
+
+        # Also extract knowledge
+        _run_knowledge_extraction(turns_text)
+    except Exception as e:
+        log.error("Summarize error: %s", e)
+
+def _run_knowledge_extraction(turns_text: str):
+    """Extract facts/preferences from conversation."""
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = client.messages.create(
+            model=RITSU_MODEL,
+            max_tokens=512,
+            system="""会話から重要な事実・好み・決定を抽出してください。
+JSON配列で返してください: [{"category":"fact|preference|decision|memo","content":"内容"}]
+最大5件。該当なければ空配列 []。JSON以外出力禁止。""",
+            messages=[{"role": "user", "content": turns_text}],
+        )
+        raw = resp.content[0].text.strip()
+        items = json.loads(raw) if raw.startswith("[") else []
+        for item in items[:5]:
+            db_save_knowledge(item.get("content", ""), item.get("category", "fact"), "auto")
+    except Exception as e:
+        log.error("Knowledge extraction error: %s", e)
+
+# --- Explicit memory commands ---
+
+def handle_memory_command(text: str) -> Optional[str]:
+    """Handle 覚えて:/忘れて:/記憶一覧 commands. Returns response or None if not a command."""
+    if text.startswith("覚えて:") or text.startswith("覚えて："):
+        content = text.split(":", 1)[-1].split("：", 1)[-1].strip()
+        if content:
+            db_save_knowledge(content, "memo", "explicit", 1.0)
+            return f"覚えました: {content}"
+        return "内容が空です。"
+
+    if text.startswith("忘れて:") or text.startswith("忘れて："):
+        content = text.split(":", 1)[-1].split("：", 1)[-1].strip()
+        if content:
+            count = db_deactivate_knowledge(content)
+            return f"{count}件の記憶を削除しました。" if count else "該当する記憶が見つかりません。"
+        return "内容が空です。"
+
+    if text.strip() in ("記憶一覧", "記憶", "メモリ", "memory"):
+        items = db_get_knowledge(30)
+        if not items:
+            return "記憶はまだありません。"
+        lines = [f"[{k['category']}] {k['content']}" for k in items]
+        return f"記憶一覧 ({len(items)}件):\n" + "\n".join(lines)
+
+    return None
+
+# --- Build dynamic system prompt with memory context ---
+
+def _build_system_prompt() -> str:
+    """Build system prompt with persona + summaries + knowledge."""
+    base = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AIアシスタント。
 性格: {PERSONA_TONE}
 
 返答ルール:
@@ -132,9 +366,32 @@ SYSTEM_PROMPT = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常
 
 emotion_tag は以下から選択: calm, happy, sorry, warn, think, neutral
 """
+    # Inject summaries
+    summaries = db_get_summaries(3)
+    if summaries:
+        base += "\n\n--- 過去の会話要約 ---\n"
+        for s in summaries:
+            base += f"・{s}\n"
+
+    # Inject knowledge
+    knowledge = db_get_knowledge(20)
+    if knowledge:
+        base += "\n--- 記憶している事実 ---\n"
+        for k in knowledge:
+            base += f"[{k['category']}] {k['content']}\n"
+
+    return base
 
 # ---------------------------------------------------------------------------
-# 5. Claude API client
+# 5. Persona (constants only — prompt built dynamically)
+# ---------------------------------------------------------------------------
+
+PERSONA_NAME = "律"
+PERSONA_CALL_USER = "司令官"
+PERSONA_TONE = "基本は落ち着いたプロ。短く結論から。癒し少し、ツンデレ軽め、たまにドジ要素。"
+
+# ---------------------------------------------------------------------------
+# 6. Claude API client (with memory integration)
 # ---------------------------------------------------------------------------
 
 _conversation: list[dict] = []
@@ -144,8 +401,18 @@ def _call_claude(user_text: str) -> dict:
     """Call Claude API and return {reply_text, emotion_tag}."""
     import anthropic  # lazy import
 
+    # Check explicit memory commands first
+    mem_response = handle_memory_command(user_text)
+    if mem_response:
+        db_save_turn("user", user_text)
+        db_save_turn("assistant", mem_response, "calm")
+        return {"reply_text": mem_response, "emotion_tag": "calm", "elapsed": 0}
+
     if not ANTHROPIC_API_KEY:
         return {"reply_text": "APIキーが設定されていません。.envを確認してください。", "emotion_tag": "warn"}
+
+    # Save user turn to DB
+    db_save_turn("user", user_text)
 
     with _conv_lock:
         _conversation.append({"role": "user", "content": user_text})
@@ -158,10 +425,11 @@ def _call_claude(user_text: str) -> dict:
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         t0 = time.time()
+        system_prompt = _build_system_prompt()
         resp = client.messages.create(
             model=RITSU_MODEL,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=msgs,
         )
         elapsed = time.time() - t0
@@ -178,6 +446,12 @@ def _call_claude(user_text: str) -> dict:
 
     with _conv_lock:
         _conversation.append({"role": "assistant", "content": raw})
+
+    # Save assistant turn to DB
+    db_save_turn("assistant", reply_text, emotion_tag)
+
+    # Trigger auto-summarize check in background
+    _auto_summarize_if_needed()
 
     return {"reply_text": reply_text, "emotion_tag": emotion_tag, "elapsed": elapsed}
 
@@ -696,7 +970,7 @@ def _toggle_gui():
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info("律 Aide V4 starting (Phase 1+2)")
+    log.info("律 Aide V4 starting (Phase 1-3)")
 
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY is not set. Claude API calls will fail.")
