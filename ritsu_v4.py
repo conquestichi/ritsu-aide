@@ -79,12 +79,11 @@ TTS_CABLE_DEVICE = env("RITSU_TTS_CABLE_DEVICE")  # empty = disabled
 WINDOW_GEOMETRY = env("RITSU_WINDOW_GEOMETRY", "480x380")
 MAX_TURNS = env_int("RITSU_MAX_TURNS", 16)
 CONVERSATION_ID = env("RITSU_CONVERSATION_ID", "default")
-STT_MODEL = env("RITSU_STT_MODEL", "small")
-STT_DEVICE = env("RITSU_STT_DEVICE", "auto")  # auto/cuda/cpu
 
 # STT (faster-whisper)
 STT_MODEL = env("RITSU_STT_MODEL", "small")
 STT_DEVICE = env("RITSU_STT_DEVICE", "auto")  # auto/cuda/cpu
+STT_INPUT_DEVICE = env("RITSU_STT_INPUT_DEVICE")  # empty=default, or device index number
 STT_SAMPLE_RATE = 16000
 STT_CHANNELS = 1
 
@@ -393,8 +392,18 @@ class PTTRecorder:
             import numpy as np
 
             rate = STT_SAMPLE_RATE
-            dev_info = sd.query_devices(kind='input')
-            log.info("PTT recording started (device: %s, rate: %d)", dev_info['name'], rate)
+
+            # Determine input device
+            input_dev = None
+            if STT_INPUT_DEVICE:
+                try:
+                    input_dev = int(STT_INPUT_DEVICE)
+                except ValueError:
+                    input_dev = None
+
+            dev_info = sd.query_devices(input_dev if input_dev is not None else sd.default.device[0])
+            log.info("PTT recording started (device #%s: %s, rate: %d)",
+                     input_dev if input_dev is not None else "default", dev_info['name'], rate)
 
             chunks: list = []
             q: queue.Queue = queue.Queue()
@@ -405,7 +414,8 @@ class PTTRecorder:
                 q.put(indata.copy())
 
             with sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                callback=callback, blocksize=4096):
+                                callback=callback, blocksize=4096,
+                                device=input_dev):
                 while not self._stop_event.is_set():
                     try:
                         data = q.get(timeout=0.2)
@@ -707,6 +717,21 @@ def main():
 
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY is not set. Claude API calls will fail.")
+
+    # List audio input devices for diagnostic
+    try:
+        import sounddevice as sd
+        log.info("=== Audio Input Devices ===")
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d['max_input_channels'] > 0:
+                marker = " <<<DEFAULT" if i == sd.default.device[0] else ""
+                log.info("  #%d: %s (in=%d ch, rate=%.0f)%s",
+                         i, d['name'], d['max_input_channels'],
+                         d['default_samplerate'], marker)
+        log.info("Set RITSU_STT_INPUT_DEVICE=<number> in .env to change input device")
+    except Exception as e:
+        log.warning("Could not list audio devices: %s", e)
 
     # Start TTS worker
     tts_thread = threading.Thread(target=_tts_worker, daemon=True, name="TTS")
