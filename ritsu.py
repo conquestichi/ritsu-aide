@@ -682,13 +682,22 @@ class TTSEngine:
 class STTEngine:
     def __init__(self):
         self._key: str = ""
-        kp = Path.home() / ".ritsu" / "openai_key.txt"
-        if kp.exists():
-            self._key = kp.read_text(encoding="utf-8").strip()
+        # Priority: RITSU_STT_API_KEY > OPENAI_API_KEY > ~/.ritsu/openai_key.txt
+        self._key = os.environ.get("RITSU_STT_API_KEY", "").strip()
+        if not self._key:
+            self._key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not self._key:
+            kp = Path.home() / ".ritsu" / "openai_key.txt"
+            if kp.exists():
+                self._key = kp.read_text(encoding="utf-8").strip()
+        if self._key:
+            log(f"[STT] API key loaded ({len(self._key)} chars)")
+        else:
+            log("[STT] WARNING: No API key found")
 
     def record_and_transcribe(self, seconds: float = 5.0) -> str:
         if not self._key:
-            return "(STT: openai_key.txt not found)"
+            return "(STT: API key not found)"
         try:
             import sounddevice as sd
             import wave, tempfile
@@ -1131,8 +1140,7 @@ class RitsuGUI:
     def _ptt_transcribe(self, wav_path: str):
         try:
             from openai import OpenAI
-            key_path = Path.home() / ".ritsu" / "openai_key.txt"
-            key = key_path.read_text(encoding="utf-8").strip() if key_path.exists() else ""
+            key = self.stt._key
             if not key:
                 self.root.after(0, self._append_out, "(STT: API key missing)\n")
                 self.root.after(0, lambda: self.status.config(text="API key missing"))
@@ -1146,6 +1154,7 @@ class RitsuGUI:
             else:
                 self.root.after(0, lambda: self.status.config(text="認識失敗（無音？）"))
         except Exception as e:
+            log(f"[STT] transcription error: {e}")
             self.root.after(0, self._append_out, f"(STT error: {e})\n")
             self.root.after(0, lambda: self.status.config(text=f"STT error: {str(e)[:30]}"))
 
