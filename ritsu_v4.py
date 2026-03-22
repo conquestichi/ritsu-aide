@@ -358,9 +358,8 @@ def stt_transcribe_file(wav_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 class PTTRecorder:
-    """PTT: hold XButton2 to record, release to stop and transcribe.
-    Uses sd.rec() — the ONLY API that works on DualSense.
-    Does NOT call sd.stop() (which zeros the buffer). Instead, slices by elapsed time."""
+    """PTT: hold XButton2 to record, release to stop.
+    Records in 0.5s chunks using sd.rec()+sd.wait() — the only working pattern."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
@@ -398,44 +397,41 @@ class PTTRecorder:
             dev_idx = input_dev if input_dev is not None else sd.default.device[0]
             dev_info = sd.query_devices(dev_idx)
             rate = int(dev_info['default_samplerate'])
-            max_seconds = 30
-            max_frames = int(rate * max_seconds)
+            chunk_sec = 0.5
+            chunk_frames = int(rate * chunk_sec)
 
-            log.info("PTT: sd.rec() device #%d (%s) rate=%d", dev_idx, dev_info['name'], rate)
+            log.info("PTT: chunk recording device #%d (%s) rate=%d chunk=%.1fs",
+                     dev_idx, dev_info['name'], rate, chunk_sec)
 
-            # Start async recording
-            audio = sd.rec(max_frames, samplerate=rate, channels=1,
-                           dtype="int16", device=dev_idx)
-            t_start = time.time()
-
-            # Wait for stop signal (button release)
+            all_chunks = []
             while not self._stop_event.is_set():
-                time.sleep(0.05)
-
-            elapsed = time.time() - t_start
-            recorded_frames = min(int(elapsed * rate), max_frames)
-
-            # Do NOT call sd.stop() — it zeros the buffer on DualSense
-            # Instead, wait just a tiny bit for the last chunk to land
-            time.sleep(0.1)
+                chunk = sd.rec(chunk_frames, samplerate=rate, channels=1,
+                               dtype="int16", device=dev_idx)
+                # sd.wait() blocks until this chunk is fully recorded
+                sd.wait()
+                all_chunks.append(chunk.copy())
+                # Check stop between chunks
+                if self._stop_event.is_set():
+                    break
 
             self._recording = False
+            log.info("PTT: %d chunks recorded", len(all_chunks))
 
-            # Slice to recorded portion
-            recorded = audio[:recorded_frames].flatten()
-            peak = int(np.max(np.abs(recorded))) if len(recorded) > 0 else 0
-            duration = len(recorded) / rate
+            if not all_chunks:
+                log.warning("PTT: no audio")
+                if self.on_status:
+                    self.on_status("音声なし")
+                return
+
+            audio = np.concatenate(all_chunks, axis=0).flatten()
+            duration = len(audio) / rate
+            peak = int(np.max(np.abs(audio)))
             log.info("PTT: %.1fs audio (peak=%d)", duration, peak)
 
             if duration < 0.3 or peak < 50:
                 log.warning("PTT: too short or silent")
                 if self.on_status:
                     self.on_status("短すぎます")
-                # Now safe to stop the background recording
-                try:
-                    sd.stop()
-                except Exception:
-                    pass
                 return
 
             # Write WAV
@@ -443,15 +439,8 @@ class PTTRecorder:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(rate)
-                wf.writeframes(recorded.tobytes())
-
+                wf.writeframes(audio.tobytes())
             log.info("PTT: WAV %d bytes", os.path.getsize(self._wav_path))
-
-            # Stop background recording now that we've saved the data
-            try:
-                sd.stop()
-            except Exception:
-                pass
 
             # Transcribe
             if self.on_status:
