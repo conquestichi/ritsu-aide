@@ -238,7 +238,7 @@ def db_save_knowledge(content: str, category: str = "fact", source: str = "auto"
         # Enforce max
         count = conn.execute("SELECT COUNT(*) FROM knowledge WHERE is_active=1").fetchone()[0]
         if count >= MAX_KNOWLEDGE:
-            conn.execute("DELETE FROM knowledge WHERE id = (SELECT id FROM knowledge WHERE is_active=1 ORDER BY updated_at ASC LIMIT 1)")
+            conn.execute("DELETE FROM knowledge WHERE id = (SELECT id FROM knowledge WHERE is_active=1 AND source != 'explicit' ORDER BY updated_at ASC LIMIT 1)")
         conn.execute("INSERT INTO knowledge (category, content, source, confidence, is_active, created_at, updated_at) VALUES (?,?,?,?,1,?,?)",
                      (category, content, source, confidence, ts, ts))
         conn.commit()
