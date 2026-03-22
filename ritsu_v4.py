@@ -204,7 +204,6 @@ def _parse_response_json(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _tts_queue: queue.Queue = queue.Queue()
-_sd_lock = threading.Lock()  # global lock for sounddevice sd.rec/sd.play (not thread-safe)
 
 def _tts_worker():
     """Background thread: consume TTS queue, synthesize & play via sounddevice."""
@@ -262,20 +261,19 @@ def _speak_voicevox(text: str, requests, np, sd):
     if nch > 1:
         audio = audio.reshape(-1, nch)
 
-    # Play on default device (locked to prevent conflict with PTT recording)
-    with _sd_lock:
-        sd.play(audio, samplerate=sr)
+    # Play on default device
+    sd.play(audio, samplerate=sr)
 
-        # Optionally also play on CABLE device
-        cable_dev = TTS_CABLE_DEVICE
-        if cable_dev:
-            try:
-                cable_idx = int(cable_dev)
-                sd.play(audio, samplerate=sr, device=cable_idx)
-            except Exception as e:
-                log.warning("CABLE device play failed: %s", e)
+    # Optionally also play on CABLE device
+    cable_dev = TTS_CABLE_DEVICE
+    if cable_dev:
+        try:
+            cable_idx = int(cable_dev)
+            sd.play(audio, samplerate=sr, device=cable_idx)
+        except Exception as e:
+            log.warning("CABLE device play failed: %s", e)
 
-        sd.wait()
+    sd.wait()
 
 def tts_speak(text: str):
     """Enqueue text for TTS playback."""
@@ -360,8 +358,7 @@ def stt_transcribe_file(wav_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 class PTTRecorder:
-    """Records audio while PTT is held, then transcribes on release.
-    Uses sd.rec()+sd.wait() in 0.5s chunks."""
+    """V3 exact pattern: soundfile + sd.InputStream + callback + rate=16000."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
@@ -371,93 +368,73 @@ class PTTRecorder:
         self._wav_path = str(Path(os.environ.get("TEMP", ".")) / "ritsu_ptt.wav")
 
     def start(self):
-        """Start recording."""
         if self._recording:
             return
         self._recording = True
         self._stop_event.clear()
         if self.on_status:
             self.on_status("録音中…")
-        threading.Thread(target=self._record_and_process, daemon=True).start()
+        threading.Thread(target=self._record, daemon=True).start()
+        log.info("PTT recording started")
 
     def stop(self):
-        """Signal recording to stop."""
+        if not self._recording:
+            return
         self._stop_event.set()
+        self._recording = False
+        # Wait for file to be written, then transcribe
+        threading.Thread(target=self._wait_and_transcribe, daemon=True).start()
 
-    def _record_and_process(self):
-        """Record in 0.5s chunks using sd.rec()+sd.wait() — same as working mic test."""
+    def _record(self):
+        """V3 exact recording pattern."""
         try:
             import sounddevice as sd
-            import numpy as np
-
-            input_dev = None
-            if STT_INPUT_DEVICE:
-                try:
-                    input_dev = int(STT_INPUT_DEVICE)
-                except ValueError:
-                    pass
-
-            dev_idx = input_dev if input_dev is not None else sd.default.device[0]
-            dev_info = sd.query_devices(dev_idx)
-            rate = int(dev_info['default_samplerate'])
-            chunk_sec = 0.5
-            chunk_frames = int(rate * chunk_sec)
-
-            log.info("PTT recording started (device #%s: %s, rate=%d)",
-                     dev_idx, dev_info['name'], rate)
-
-            chunks = []
-            with _sd_lock:
-                while not self._stop_event.is_set():
-                    chunk = sd.rec(chunk_frames, samplerate=rate,
-                                   channels=1, dtype="int16", device=dev_idx)
-                    sd.wait()
-                    chunks.append(chunk.copy())
-
-            self._recording = False
-
-            if not chunks:
-                log.warning("PTT: no chunks")
-                if self.on_status:
-                    self.on_status("音声なし")
-                return
-
-            audio = np.concatenate(chunks, axis=0).flatten()
-            duration = len(audio) / rate
-            peak = int(np.max(np.abs(audio)))
-            log.info("PTT: %.1fs audio (%d chunks, peak=%d)", duration, len(chunks), peak)
-
-            if duration < 0.3:
-                log.warning("PTT: too short")
-                if self.on_status:
-                    self.on_status("短すぎます")
-                return
-
-            # Write WAV
-            with wave.open(self._wav_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(rate)
-                wf.writeframes(audio.tobytes())
-
-            if self.on_status:
-                self.on_status("認識中…")
-            text = stt_transcribe_file(self._wav_path)
-            if text and not text.startswith("("):
-                log.info("PTT transcribed: %s", text)
-                if self.on_status:
-                    self.on_status(f"認識: {text[:30]}")
-                if self.on_result:
-                    self.on_result(text)
-            else:
-                log.warning("PTT: transcription result: %s", text)
-                if self.on_status:
-                    self.on_status("認識失敗")
+            import soundfile as sf
+            rate = 16000
+            q: queue.Queue = queue.Queue()
+            def cb(indata, frames, time_info, status):
+                q.put(indata.copy())
+            with sf.SoundFile(self._wav_path, mode="w", samplerate=rate,
+                              channels=1, subtype="PCM_16") as f:
+                with sd.InputStream(samplerate=rate, channels=1, dtype="int16", callback=cb):
+                    while not self._stop_event.is_set():
+                        try:
+                            data = q.get(timeout=0.2)
+                            f.write(data)
+                        except Exception:
+                            continue
+            log.info("PTT recording finished, file written")
         except Exception as e:
-            log.error("PTT error: %s", e)
-            self._recording = False
+            log.error("PTT record error: %s", e)
+
+    def _wait_and_transcribe(self):
+        time.sleep(0.3)
+        if not os.path.exists(self._wav_path):
+            log.warning("PTT: no WAV file")
             if self.on_status:
-                self.on_status(f"エラー: {e}")
+                self.on_status("録音失敗")
+            return
+        # Check file size
+        fsize = os.path.getsize(self._wav_path)
+        log.info("PTT: WAV file %d bytes", fsize)
+        if fsize < 1000:
+            log.warning("PTT: file too small")
+            if self.on_status:
+                self.on_status("短すぎます")
+            return
+        if self.on_status:
+            self.on_status("認識中…")
+        text = stt_transcribe_file(self._wav_path)
+        if text and not text.startswith("("):
+            log.info("PTT transcribed: %s", text)
+            if self.on_status:
+                self.on_status(f"認識: {text[:30]}")
+            if self.on_result:
+                self.on_result(text)
+        else:
+            log.warning("PTT: transcription result: %s", text)
+            if self.on_status:
+                self.on_status("認識失敗")
 
 # ---------------------------------------------------------------------------
 # 9. Hotkey Thread — Win32 API (RegisterHotKey + WH_MOUSE_LL)
