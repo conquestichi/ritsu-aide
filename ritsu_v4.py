@@ -358,27 +358,30 @@ def stt_transcribe_file(wav_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 class PTTRecorder:
-    """PTT: XButton2 press → 5秒固定録音 → 自動認識。
-    sd.rec()+sd.wait() が DualSense で唯一動くパターン。"""
+    """PTT: hold XButton2 to record, release to stop.
+    0.5s chunk sd.rec()+sd.wait() loop — proven working on all 3 tests."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
         self.on_status = on_status
-        self._busy = False
+        self._recording = False
+        self._stop_event = threading.Event()
         self._wav_path = str(Path(os.environ.get("TEMP", ".")) / "ritsu_ptt.wav")
 
     def start(self):
-        """XButton2 pressed — start 5s recording."""
-        if self._busy:
+        if self._recording:
             return
-        self._busy = True
+        self._recording = True
+        self._stop_event.clear()
         if self.on_status:
-            self.on_status("録音中(5秒)…")
+            self.on_status("録音中…")
         threading.Thread(target=self._record, daemon=True).start()
+        log.info("PTT recording started")
 
     def stop(self):
-        """XButton2 released — ignored (fixed duration)."""
-        pass
+        if not self._recording:
+            return
+        self._stop_event.set()
 
     def _record(self):
         try:
@@ -394,32 +397,41 @@ class PTTRecorder:
             dev_idx = input_dev if input_dev is not None else sd.default.device[0]
             dev_info = sd.query_devices(dev_idx)
             rate = int(dev_info['default_samplerate'])
-            rec_sec = 5
-            frames = int(rate * rec_sec)
+            chunk_frames = int(rate * 0.5)
 
-            log.info("PTT: recording %ds on #%d (%s) rate=%d",
-                     rec_sec, dev_idx, dev_info['name'], rate)
+            log.info("PTT: device #%d (%s) rate=%d", dev_idx, dev_info['name'], rate)
 
-            audio = sd.rec(frames, samplerate=rate, channels=1,
-                           dtype="int16", device=dev_idx)
-            sd.wait()
+            chunks = []
+            while not self._stop_event.is_set():
+                chunk = sd.rec(chunk_frames, samplerate=rate, channels=1,
+                               dtype="int16", device=dev_idx)
+                sd.wait()
+                chunks.append(chunk.copy())
 
-            peak = int(np.max(np.abs(audio)))
-            log.info("PTT: %ds recorded, peak=%d", rec_sec, peak)
+            self._recording = False
 
-            if peak < 50:
-                log.warning("PTT: silent")
+            if not chunks:
+                log.warning("PTT: no audio")
                 if self.on_status:
-                    self.on_status("無音")
-                self._busy = False
+                    self.on_status("音声なし")
                 return
 
-            flat = audio.flatten()
+            audio = np.concatenate(chunks, axis=0).flatten()
+            duration = len(audio) / rate
+            peak = int(np.max(np.abs(audio)))
+            log.info("PTT: %.1fs audio (%d chunks, peak=%d)", duration, len(chunks), peak)
+
+            if duration < 0.3 or peak < 50:
+                log.warning("PTT: too short or silent")
+                if self.on_status:
+                    self.on_status("短すぎます")
+                return
+
             with wave.open(self._wav_path, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(rate)
-                wf.writeframes(flat.tobytes())
+                wf.writeframes(audio.tobytes())
             log.info("PTT: WAV %d bytes", os.path.getsize(self._wav_path))
 
             if self.on_status:
@@ -437,10 +449,9 @@ class PTTRecorder:
                     self.on_status("認識失敗")
         except Exception as e:
             log.error("PTT error: %s", e)
+            self._recording = False
             if self.on_status:
                 self.on_status(f"エラー: {e}")
-        finally:
-            self._busy = False
 
 # ---------------------------------------------------------------------------
 # 9. Hotkey Thread — Win32 API (RegisterHotKey + WH_MOUSE_LL)
