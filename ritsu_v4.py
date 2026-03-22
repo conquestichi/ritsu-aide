@@ -359,7 +359,8 @@ def stt_transcribe_file(wav_path: str) -> str:
 
 class PTTRecorder:
     """PTT: hold XButton2 to record, release to stop and transcribe.
-    Uses pyaudio for reliable streaming on DualSense."""
+    Uses sd.rec() — the ONLY API that works on DualSense.
+    Does NOT call sd.stop() (which zeros the buffer). Instead, slices by elapsed time."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
@@ -382,73 +383,59 @@ class PTTRecorder:
         if not self._recording:
             return
         self._stop_event.set()
-        self._recording = False
 
     def _record(self):
-        """Record with pyaudio, then transcribe."""
         try:
-            import pyaudio
+            import sounddevice as sd
             import numpy as np
 
-            rate = 44100
-            chunk = 4096
-            fmt = pyaudio.paInt16
-
-            pa = pyaudio.PyAudio()
-
-            # Find device
-            dev_idx = None
+            input_dev = None
             if STT_INPUT_DEVICE:
                 try:
-                    dev_idx = int(STT_INPUT_DEVICE)
+                    input_dev = int(STT_INPUT_DEVICE)
                 except ValueError:
                     pass
+            dev_idx = input_dev if input_dev is not None else sd.default.device[0]
+            dev_info = sd.query_devices(dev_idx)
+            rate = int(dev_info['default_samplerate'])
+            max_seconds = 30
+            max_frames = int(rate * max_seconds)
 
-            if dev_idx is None:
-                dev_idx = pa.get_default_input_device_info()['index']
+            log.info("PTT: sd.rec() device #%d (%s) rate=%d", dev_idx, dev_info['name'], rate)
 
-            dev_info = pa.get_device_info_by_index(dev_idx)
-            # Use device native rate
-            native_rate = int(dev_info['defaultSampleRate'])
-            if native_rate > 0:
-                rate = native_rate
+            # Start async recording
+            audio = sd.rec(max_frames, samplerate=rate, channels=1,
+                           dtype="int16", device=dev_idx)
+            t_start = time.time()
 
-            log.info("PTT: pyaudio device #%d (%s) rate=%d",
-                     dev_idx, dev_info['name'], rate)
-
-            stream = pa.open(format=fmt, channels=1, rate=rate,
-                             input=True, input_device_index=dev_idx,
-                             frames_per_buffer=chunk)
-
-            frames = []
+            # Wait for stop signal (button release)
             while not self._stop_event.is_set():
-                try:
-                    data = stream.read(chunk, exception_on_overflow=False)
-                    frames.append(data)
-                except Exception as e:
-                    log.warning("PTT read error: %s", e)
-                    break
+                time.sleep(0.05)
 
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
+            elapsed = time.time() - t_start
+            recorded_frames = min(int(elapsed * rate), max_frames)
 
-            if not frames:
-                log.warning("PTT: no frames")
-                if self.on_status:
-                    self.on_status("音声なし")
-                return
+            # Do NOT call sd.stop() — it zeros the buffer on DualSense
+            # Instead, wait just a tiny bit for the last chunk to land
+            time.sleep(0.1)
 
-            audio_bytes = b"".join(frames)
-            duration = len(audio_bytes) / (rate * 2)  # 16bit = 2 bytes
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-            peak = int(np.max(np.abs(audio_np)))
-            log.info("PTT: %.1fs audio (peak=%d, %d frames)", duration, peak, len(frames))
+            self._recording = False
+
+            # Slice to recorded portion
+            recorded = audio[:recorded_frames].flatten()
+            peak = int(np.max(np.abs(recorded))) if len(recorded) > 0 else 0
+            duration = len(recorded) / rate
+            log.info("PTT: %.1fs audio (peak=%d)", duration, peak)
 
             if duration < 0.3 or peak < 50:
                 log.warning("PTT: too short or silent")
                 if self.on_status:
                     self.on_status("短すぎます")
+                # Now safe to stop the background recording
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
                 return
 
             # Write WAV
@@ -456,9 +443,15 @@ class PTTRecorder:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(rate)
-                wf.writeframes(audio_bytes)
+                wf.writeframes(recorded.tobytes())
 
             log.info("PTT: WAV %d bytes", os.path.getsize(self._wav_path))
+
+            # Stop background recording now that we've saved the data
+            try:
+                sd.stop()
+            except Exception:
+                pass
 
             # Transcribe
             if self.on_status:
@@ -476,6 +469,7 @@ class PTTRecorder:
                     self.on_status("認識失敗")
         except Exception as e:
             log.error("PTT error: %s", e)
+            self._recording = False
             if self.on_status:
                 self.on_status(f"エラー: {e}")
 
