@@ -204,6 +204,7 @@ def _parse_response_json(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _tts_queue: queue.Queue = queue.Queue()
+_sd_lock = threading.Lock()  # global lock for sounddevice sd.rec/sd.play (not thread-safe)
 
 def _tts_worker():
     """Background thread: consume TTS queue, synthesize & play via sounddevice."""
@@ -261,19 +262,20 @@ def _speak_voicevox(text: str, requests, np, sd):
     if nch > 1:
         audio = audio.reshape(-1, nch)
 
-    # Play on default device
-    sd.play(audio, samplerate=sr)
+    # Play on default device (locked to prevent conflict with PTT recording)
+    with _sd_lock:
+        sd.play(audio, samplerate=sr)
 
-    # Optionally also play on CABLE device
-    cable_dev = TTS_CABLE_DEVICE
-    if cable_dev:
-        try:
-            cable_idx = int(cable_dev)
-            sd.play(audio, samplerate=sr, device=cable_idx)
-        except Exception as e:
-            log.warning("CABLE device play failed: %s", e)
+        # Optionally also play on CABLE device
+        cable_dev = TTS_CABLE_DEVICE
+        if cable_dev:
+            try:
+                cable_idx = int(cable_dev)
+                sd.play(audio, samplerate=sr, device=cable_idx)
+            except Exception as e:
+                log.warning("CABLE device play failed: %s", e)
 
-    sd.wait()
+        sd.wait()
 
 def tts_speak(text: str):
     """Enqueue text for TTS playback."""
@@ -359,7 +361,7 @@ def stt_transcribe_file(wav_path: str) -> str:
 
 class PTTRecorder:
     """Records audio while PTT is held, then transcribes on release.
-    sd.rec() + sd.stop() must run in the SAME thread."""
+    Uses sd.rec()+sd.wait() in 0.5s chunks."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
@@ -405,11 +407,12 @@ class PTTRecorder:
                      dev_idx, dev_info['name'], rate)
 
             chunks = []
-            while not self._stop_event.is_set():
-                chunk = sd.rec(chunk_frames, samplerate=rate,
-                               channels=1, dtype="int16", device=dev_idx)
-                sd.wait()
-                chunks.append(chunk.copy())
+            with _sd_lock:
+                while not self._stop_event.is_set():
+                    chunk = sd.rec(chunk_frames, samplerate=rate,
+                                   channels=1, dtype="int16", device=dev_idx)
+                    sd.wait()
+                    chunks.append(chunk.copy())
 
             self._recording = False
 
@@ -716,24 +719,6 @@ def main():
                          i, d['name'], d['max_input_channels'],
                          d['default_samplerate'], marker)
         log.info("Set RITSU_STT_INPUT_DEVICE=<number> in .env to change input device")
-
-        # Quick mic test (0.5s recording) — in background to not block GUI
-        def _mic_test():
-            try:
-                default_idx = sd.default.device[0]
-                dev = sd.query_devices(default_idx)
-                test_rate = int(dev['default_samplerate'])
-                log.info("Testing mic (device #%d, rate=%d)...", default_idx, test_rate)
-                test_audio = sd.rec(int(test_rate * 0.5), samplerate=test_rate,
-                                    channels=1, dtype="int16", device=default_idx)
-                sd.wait()
-                import numpy as np
-                peak = np.max(np.abs(test_audio))
-                log.info("Mic test: peak=%d (0=silent, 32767=max). %s",
-                         peak, "OK" if peak > 100 else "WARNING: very quiet or silent!")
-            except Exception as e:
-                log.warning("Mic test failed: %s", e)
-        threading.Thread(target=_mic_test, daemon=True).start()
     except Exception as e:
         log.warning("Could not list audio devices: %s", e)
 
