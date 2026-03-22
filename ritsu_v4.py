@@ -300,73 +300,83 @@ def handle_user_input(text: str, log_callback=None):
 def run_gui():
     """Main GUI loop (must run in main thread)."""
     import tkinter as tk
-    from tkinter import scrolledtext
 
     root = tk.Tk()
     root.title(f"{PERSONA_NAME} Aide V4")
     root.geometry(WINDOW_GEOMETRY)
-    root.configure(bg="#2d2d2d")
+    root.attributes("-topmost", True)
+    root.configure(bg="#1e1e2e")
 
-    # --- Log area ---
-    log_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, state=tk.DISABLED,
-                                          font=("Meiryo UI", 9), bg="#1e1e1e", fg="#d4d4d4",
-                                          insertbackground="#d4d4d4")
-    log_area.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 0))
+    # Title
+    tk.Label(root, text=f"{PERSONA_NAME} — V4",
+             bg="#1e1e2e", fg="#cdd6f4", font=("Segoe UI", 11, "bold"),
+             anchor="w").pack(fill="x", padx=10, pady=(8, 0))
 
-    # --- Input frame ---
-    input_frame = tk.Frame(root, bg="#2d2d2d")
-    input_frame.pack(fill=tk.X, padx=4, pady=4)
+    # Input (tk.Text, same as V3 — proven to work on this machine)
+    inp = tk.Text(root, height=3, wrap="word",
+                  bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
+                  font=("Segoe UI", 10), relief="flat", padx=8, pady=6)
+    inp.pack(fill="x", padx=10, pady=(6, 0))
 
-    # Use Text(height=1) instead of Entry — better IME support on Japanese Windows
-    entry = tk.Text(input_frame, font=("Meiryo UI", 10), bg="#3c3c3c", fg="#d4d4d4",
-                    insertbackground="#d4d4d4", relief=tk.FLAT, height=1, wrap=tk.NONE,
-                    undo=True)
-    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=2)
+    # Button frame
+    btn_frame = tk.Frame(root, bg="#1e1e2e")
+    btn_frame.pack(fill="x", padx=10, pady=4)
+
+    status_label = tk.Label(btn_frame, text="", bg="#1e1e2e", fg="#a6adc8",
+                            font=("Segoe UI", 8))
+    status_label.pack(side="right")
+
+    # Output log
+    out = tk.Text(root, height=10, wrap="word", state="disabled",
+                  bg="#181825", fg="#bac2de", font=("Segoe UI", 10),
+                  relief="flat", padx=8, pady=6)
+    out.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     def append_log(msg: str):
-        log_area.config(state=tk.NORMAL)
-        log_area.insert(tk.END, msg + "\n")
-        log_area.see(tk.END)
-        log_area.config(state=tk.DISABLED)
+        out.config(state="normal")
+        out.insert("end", msg + "\n")
+        out.see("end")
+        out.config(state="disabled")
 
-    def get_entry_text() -> str:
-        return entry.get("1.0", tk.END).strip()
-
-    def clear_entry():
-        entry.delete("1.0", tk.END)
+    def set_status(msg: str):
+        status_label.config(text=msg)
 
     def on_send(event=None):
-        text = get_entry_text()
+        text = inp.get("1.0", "end").strip()
         if not text:
             return "break"
-        clear_entry()
-        threading.Thread(target=handle_user_input,
-                         args=(text, lambda m: root.after(0, append_log, m)),
-                         daemon=True).start()
-        return "break"  # prevent newline insertion
+        inp.delete("1.0", "end")
+        set_status("考え中…")
+        threading.Thread(target=_do_send, args=(text,), daemon=True).start()
+        return "break"
 
-    entry.bind("<Return>", on_send)
+    def _do_send(text: str):
+        log_cb = lambda m: root.after(0, append_log, m)
+        log_cb(f"[{PERSONA_CALL_USER}] {text}")
+        result = _call_claude(text)
+        reply = result["reply_text"]
+        emotion = result["emotion_tag"]
+        elapsed = result.get("elapsed", 0)
+        tag = f" [{emotion}]" if emotion != "neutral" else ""
+        time_str = f" ({elapsed:.1f}s)" if elapsed else ""
+        log_cb(f"[{PERSONA_NAME}]{tag}{time_str} {reply}")
+        root.after(0, set_status, f"{emotion} {elapsed:.1f}s")
+        tts_speak(reply)
 
-    send_btn = tk.Button(input_frame, text="送信", command=on_send,
-                         font=("Meiryo UI", 9), bg="#0e639c", fg="white",
-                         relief=tk.FLAT, padx=12)
-    send_btn.pack(side=tk.RIGHT, padx=(4, 0))
+    inp.bind("<Return>", on_send)
 
-    # Welcome message
+    send_btn = tk.Button(btn_frame, text="送信", command=on_send,
+                         bg="#89b4fa", fg="#1e1e2e",
+                         font=("Segoe UI", 9, "bold"),
+                         relief="flat", padx=16, pady=2)
+    send_btn.pack(side="left")
+
+    # Welcome
     root.after(100, lambda: append_log(
         f"[{PERSONA_NAME}] V4起動完了。テキスト入力で会話できます。"))
 
     # Focus
-    def _force_focus():
-        root.deiconify()
-        root.lift()
-        root.focus_force()
-        entry.focus_force()
-        root.attributes("-topmost", True)
-    root.after(300, _force_focus)
-
-    # Click anywhere → focus entry
-    root.bind("<Button-1>", lambda e: root.after(10, entry.focus_force))
+    root.after(300, lambda: inp.focus_force())
 
     root.mainloop()
 
