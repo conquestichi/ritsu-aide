@@ -306,8 +306,7 @@ def run_gui():
     root.title(f"{PERSONA_NAME} Aide V4")
     geo = WINDOW_GEOMETRY
     root.geometry(geo)
-    root.attributes("-topmost", True)
-
+    # topmost is set AFTER focus acquisition to avoid UIPI focus steal issues
     # --- Log area ---
     log_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, state=tk.DISABLED,
                                           font=("Meiryo UI", 9), bg="#1e1e1e", fg="#d4d4d4",
@@ -350,13 +349,16 @@ def run_gui():
 
     # Force focus on entry (topmost windows on Windows often lose keyboard focus)
     def _force_focus():
+        root.deiconify()
         root.lift()
         root.focus_force()
-        entry.focus_set()
+        entry.focus_force()
+        root.attributes("-topmost", True)
     root.after(300, _force_focus)
+    root.after(600, lambda: entry.focus_force())
 
     # Click anywhere on window → focus entry
-    root.bind("<Button-1>", lambda e: entry.focus_set())
+    root.bind("<Button-1>", lambda e: root.after(10, entry.focus_force))
 
     root.mainloop()
 
