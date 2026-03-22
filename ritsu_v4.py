@@ -359,12 +359,13 @@ def stt_transcribe_file(wav_path: str) -> str:
 
 class PTTRecorder:
     """Records audio while PTT is held, then transcribes on release.
-    Uses sd.rec()/sd.stop() — simplest sounddevice pattern."""
+    sd.rec() + sd.stop() must run in the SAME thread."""
 
     def __init__(self, on_result=None, on_status=None):
         self.on_result = on_result
         self.on_status = on_status
         self._recording = False
+        self._stop_event = threading.Event()
         self._wav_path = str(Path(os.environ.get("TEMP", ".")) / "ritsu_ptt.wav")
 
     def start(self):
@@ -372,13 +373,21 @@ class PTTRecorder:
         if self._recording:
             return
         self._recording = True
+        self._stop_event.clear()
         if self.on_status:
             self.on_status("録音中…")
-        threading.Thread(target=self._start_rec, daemon=True).start()
+        threading.Thread(target=self._record_and_process, daemon=True).start()
 
-    def _start_rec(self):
+    def stop(self):
+        """Signal recording to stop."""
+        self._stop_event.set()
+
+    def _record_and_process(self):
+        """Single thread: record → wait for stop → transcribe."""
         try:
             import sounddevice as sd
+            import numpy as np
+
             input_dev = None
             if STT_INPUT_DEVICE:
                 try:
@@ -389,41 +398,25 @@ class PTTRecorder:
             dev_idx = input_dev if input_dev is not None else sd.default.device[0]
             dev_info = sd.query_devices(dev_idx)
             rate = int(dev_info['default_samplerate'])
-            max_seconds = 30  # max recording length
+            max_seconds = 30
 
             log.info("PTT recording started (device #%s: %s, rate=%d)",
                      dev_idx, dev_info['name'], rate)
 
-            # sd.rec is the simplest recording method
-            self._rate = rate
-            self._max_frames = int(rate * max_seconds)
-            self._audio = sd.rec(self._max_frames, samplerate=rate,
-                                  channels=1, dtype="int16", device=dev_idx)
-        except Exception as e:
-            log.error("PTT start error: %s", e)
+            max_frames = int(rate * max_seconds)
+            # Start recording (same thread will also stop it)
+            audio = sd.rec(max_frames, samplerate=rate,
+                           channels=1, dtype="int16", device=dev_idx)
+
+            # Wait for stop signal
+            while not self._stop_event.is_set():
+                time.sleep(0.05)
+
+            # Stop from SAME thread that started
+            sd.stop()
             self._recording = False
 
-    def stop(self):
-        """Stop recording and transcribe."""
-        if not self._recording:
-            return
-        self._recording = False
-        threading.Thread(target=self._stop_and_transcribe, daemon=True).start()
-
-    def _stop_and_transcribe(self):
-        try:
-            import sounddevice as sd
-            import numpy as np
-
-            sd.stop()
-            time.sleep(0.1)
-
-            audio = getattr(self, '_audio', None)
-            if audio is None:
-                log.warning("PTT: no audio buffer")
-                return
-
-            # Trim silence at end (find last non-zero sample)
+            # Trim trailing zeros
             flat = audio.flatten()
             nonzero = np.nonzero(flat)[0]
             if len(nonzero) == 0:
@@ -431,11 +424,12 @@ class PTTRecorder:
                 if self.on_status:
                     self.on_status("無音")
                 return
+
             last = nonzero[-1]
             trimmed = flat[:last + 1]
-            rate = getattr(self, '_rate', 44100)
             duration = len(trimmed) / rate
-            log.info("PTT: %.1fs audio captured (peak=%d)", duration, np.max(np.abs(trimmed)))
+            peak = int(np.max(np.abs(trimmed)))
+            log.info("PTT: %.1fs audio (peak=%d)", duration, peak)
 
             if duration < 0.3:
                 log.warning("PTT: too short")
@@ -464,7 +458,8 @@ class PTTRecorder:
                 if self.on_status:
                     self.on_status("認識失敗")
         except Exception as e:
-            log.error("PTT stop error: %s", e)
+            log.error("PTT error: %s", e)
+            self._recording = False
             if self.on_status:
                 self.on_status(f"エラー: {e}")
 
