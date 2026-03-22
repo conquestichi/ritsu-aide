@@ -386,24 +386,42 @@ class PTTRecorder:
         threading.Thread(target=self._wait_and_transcribe, daemon=True).start()
 
     def _record(self):
-        """V3 exact recording pattern."""
+        """Record using device native sample rate (DualSense rejects 16kHz)."""
         try:
             import sounddevice as sd
             import soundfile as sf
-            rate = 16000
+
+            input_dev = None
+            if STT_INPUT_DEVICE:
+                try:
+                    input_dev = int(STT_INPUT_DEVICE)
+                except ValueError:
+                    pass
+            dev_idx = input_dev if input_dev is not None else sd.default.device[0]
+            dev_info = sd.query_devices(dev_idx)
+            rate = int(dev_info['default_samplerate'])  # use native rate
+
+            log.info("PTT: using device #%d (%s) at %dHz", dev_idx, dev_info['name'], rate)
+
             q: queue.Queue = queue.Queue()
+            cb_count = [0]
             def cb(indata, frames, time_info, status):
+                if status:
+                    log.warning("PTT cb status: %s", status)
+                cb_count[0] += 1
                 q.put(indata.copy())
+
             with sf.SoundFile(self._wav_path, mode="w", samplerate=rate,
                               channels=1, subtype="PCM_16") as f:
-                with sd.InputStream(samplerate=rate, channels=1, dtype="int16", callback=cb):
+                with sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                                    callback=cb, device=dev_idx):
                     while not self._stop_event.is_set():
                         try:
                             data = q.get(timeout=0.2)
                             f.write(data)
                         except Exception:
                             continue
-            log.info("PTT recording finished, file written")
+            log.info("PTT recording finished (callbacks=%d)", cb_count[0])
         except Exception as e:
             log.error("PTT record error: %s", e)
 
