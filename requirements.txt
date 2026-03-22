@@ -1,4 +1,5 @@
 anthropic
+faster-whisper
 sounddevice
 numpy
 requests

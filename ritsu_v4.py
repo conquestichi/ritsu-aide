@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""律 Aide V4 — Windows完結・API最小・1ファイル常駐AIアシスタント (Phase 1)"""
+"""律 Aide V4 — Windows完結・API最小・1ファイル常駐AIアシスタント (Phase 1+2)"""
 
 import ctypes
+import ctypes.wintypes
 import io
 import json
 import logging
@@ -74,6 +75,14 @@ TTS_CABLE_DEVICE = env("RITSU_TTS_CABLE_DEVICE")  # empty = disabled
 WINDOW_GEOMETRY = env("RITSU_WINDOW_GEOMETRY", "480x380")
 MAX_TURNS = env_int("RITSU_MAX_TURNS", 16)
 CONVERSATION_ID = env("RITSU_CONVERSATION_ID", "default")
+STT_MODEL = env("RITSU_STT_MODEL", "small")
+STT_DEVICE = env("RITSU_STT_DEVICE", "auto")  # auto/cuda/cpu
+
+# STT (faster-whisper)
+STT_MODEL = env("RITSU_STT_MODEL", "small")
+STT_DEVICE = env("RITSU_STT_DEVICE", "auto")  # auto/cuda/cpu
+STT_SAMPLE_RATE = 16000
+STT_CHANNELS = 1
 
 # ---------------------------------------------------------------------------
 # 3. Singleton guard
@@ -268,6 +277,260 @@ def tts_speak(text: str):
     _tts_queue.put(text)
 
 # ---------------------------------------------------------------------------
+# 7. STT — faster-whisper (local)
+# ---------------------------------------------------------------------------
+
+_stt_model = None
+_stt_lock = threading.Lock()
+
+def _get_stt_model():
+    """Lazy-load faster-whisper model."""
+    global _stt_model
+    if _stt_model is not None:
+        return _stt_model
+    with _stt_lock:
+        if _stt_model is not None:
+            return _stt_model
+        try:
+            from faster_whisper import WhisperModel
+            device = STT_DEVICE
+            if device == "auto":
+                try:
+                    import torch
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                except ImportError:
+                    device = "cpu"
+            compute = "float16" if device == "cuda" else "int8"
+            log.info("Loading faster-whisper model=%s device=%s compute=%s", STT_MODEL, device, compute)
+            t0 = time.time()
+            _stt_model = WhisperModel(STT_MODEL, device=device, compute_type=compute)
+            log.info("STT model loaded in %.1fs", time.time() - t0)
+        except Exception as e:
+            log.error("Failed to load STT model: %s", e)
+            _stt_model = None
+    return _stt_model
+
+def stt_transcribe(audio_data, sample_rate: int = STT_SAMPLE_RATE) -> str:
+    """Transcribe audio numpy array to text using faster-whisper."""
+    import numpy as np
+    model = _get_stt_model()
+    if model is None:
+        return ""
+    # Ensure float32 mono
+    if audio_data.dtype != np.float32:
+        audio_data = audio_data.astype(np.float32)
+    if audio_data.ndim > 1:
+        audio_data = audio_data.mean(axis=1)
+    # Resample to 16kHz if needed
+    if sample_rate != 16000:
+        ratio = 16000 / sample_rate
+        new_len = int(len(audio_data) * ratio)
+        indices = np.linspace(0, len(audio_data) - 1, new_len)
+        audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data).astype(np.float32)
+    try:
+        segments, info = model.transcribe(audio_data, language="ja")
+        text = "".join(s.text for s in segments).strip()
+        return text
+    except Exception as e:
+        log.error("STT transcribe error: %s", e)
+        return ""
+
+# ---------------------------------------------------------------------------
+# 8. PTT (Push-to-Talk) recording
+# ---------------------------------------------------------------------------
+
+class PTTRecorder:
+    """Records audio while PTT is held, then transcribes on release."""
+
+    def __init__(self, on_result=None, on_status=None):
+        self.on_result = on_result    # callback(text: str)
+        self.on_status = on_status    # callback(status: str)
+        self._recording = False
+        self._frames: list = []
+        self._stream = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        """Start recording."""
+        import sounddevice as sd
+        import numpy as np
+        with self._lock:
+            if self._recording:
+                return
+            self._recording = True
+            self._frames = []
+        if self.on_status:
+            self.on_status("録音中…")
+        log.info("PTT recording started")
+        try:
+            self._stream = sd.InputStream(
+                samplerate=STT_SAMPLE_RATE,
+                channels=STT_CHANNELS,
+                dtype="float32",
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except Exception as e:
+            log.error("PTT start failed: %s", e)
+            self._recording = False
+
+    def stop(self):
+        """Stop recording and transcribe."""
+        import numpy as np
+        with self._lock:
+            if not self._recording:
+                return
+            self._recording = False
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        frames = self._frames
+        self._frames = []
+        if not frames:
+            log.warning("PTT: no audio captured")
+            return
+        audio = np.concatenate(frames, axis=0).flatten()
+        duration = len(audio) / STT_SAMPLE_RATE
+        log.info("PTT recording stopped: %.1fs audio", duration)
+        if duration < 0.3:
+            log.warning("PTT: too short (%.1fs), ignoring", duration)
+            if self.on_status:
+                self.on_status("短すぎます")
+            return
+        if self.on_status:
+            self.on_status("認識中…")
+        # Transcribe in background
+        threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        if self._recording:
+            self._frames.append(indata.copy())
+
+    def _transcribe(self, audio):
+        text = stt_transcribe(audio, STT_SAMPLE_RATE)
+        if text:
+            log.info("PTT transcribed: %s", text)
+            if self.on_status:
+                self.on_status(f"認識: {text[:30]}")
+            if self.on_result:
+                self.on_result(text)
+        else:
+            log.warning("PTT: empty transcription")
+            if self.on_status:
+                self.on_status("認識失敗")
+
+# ---------------------------------------------------------------------------
+# 9. Hotkey Thread — Win32 API (RegisterHotKey + WH_MOUSE_LL)
+# ---------------------------------------------------------------------------
+
+# Mouse button constants
+WM_HOTKEY = 0x0312
+WH_MOUSE_LL = 14
+WM_XBUTTONDOWN = 0x020B
+WM_XBUTTONUP = 0x020C
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
+HIWORD = lambda x: (x >> 16) & 0xFFFF
+
+# Callback holder at module level to prevent GC (critical for ctypes)
+_mouse_hook_handle = None
+_mouse_proc_ref = None  # prevent GC of the callback
+
+def start_hotkey_thread(on_toggle_gui=None, on_ptt_start=None, on_ptt_stop=None):
+    """Start hotkey thread. All callbacks are called from this thread — use root.after() to dispatch to GUI."""
+    def _hotkey_thread():
+        global _mouse_hook_handle, _mouse_proc_ref
+
+        user32 = ctypes.windll.user32
+
+        # --- Types for 64-bit safety ---
+        LRESULT = ctypes.c_longlong
+        WPARAM = ctypes.c_ulonglong
+        LPARAM = ctypes.c_longlong
+        HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, WPARAM, LPARAM)
+
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("pt_x", ctypes.c_long),
+                ("pt_y", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("flags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        # Fix argtypes for 64-bit
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int, HOOKPROC, ctypes.c_void_p, ctypes.c_ulong
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, WPARAM, LPARAM
+        ]
+        user32.CallNextHookEx.restype = LRESULT
+
+        # --- Register F10 hotkey ---
+        F10_ID = 1
+        VK_F10 = 0x79
+        try:
+            if user32.RegisterHotKey(None, F10_ID, 0, VK_F10):
+                log.info("Hotkey F10 registered (toggle GUI)")
+            else:
+                log.warning("Failed to register F10 hotkey (may be in use by another app)")
+        except Exception as e:
+            log.warning("F10 hotkey error: %s", e)
+
+        # --- Mouse hook callback ---
+        _ptt_held = False
+
+        def mouse_proc(nCode, wParam, lParam):
+            nonlocal _ptt_held
+            if nCode >= 0 and lParam:
+                ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                xbtn = HIWORD(ms.mouseData)
+
+                if wParam == WM_XBUTTONDOWN:
+                    if xbtn == XBUTTON1 and on_toggle_gui:
+                        on_toggle_gui()
+                    elif xbtn == XBUTTON2 and not _ptt_held:
+                        _ptt_held = True
+                        if on_ptt_start:
+                            on_ptt_start()
+                elif wParam == WM_XBUTTONUP:
+                    if xbtn == XBUTTON2 and _ptt_held:
+                        _ptt_held = False
+                        if on_ptt_stop:
+                            on_ptt_stop()
+
+            return user32.CallNextHookEx(_mouse_hook_handle, nCode, wParam, lParam)
+
+        _mouse_proc_ref = HOOKPROC(mouse_proc)
+        _mouse_hook_handle = user32.SetWindowsHookExW(
+            WH_MOUSE_LL, _mouse_proc_ref, None, 0
+        )
+        if _mouse_hook_handle:
+            log.info("Mouse hook installed (XButton1=toggle, XButton2=PTT)")
+        else:
+            log.error("Failed to install mouse hook")
+
+        # --- Message loop (same thread as hook) ---
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY and msg.wParam == F10_ID:
+                if on_toggle_gui:
+                    on_toggle_gui()
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    t = threading.Thread(target=_hotkey_thread, daemon=True, name="Hotkey")
+    t.start()
+    return t
+
+# ---------------------------------------------------------------------------
 # 7. Chat handler (combines Claude + TTS)
 # ---------------------------------------------------------------------------
 
@@ -294,29 +557,37 @@ def handle_user_input(text: str, log_callback=None):
     tts_speak(reply)
 
 # ---------------------------------------------------------------------------
-# 8. tkinter GUI
+# 10. tkinter GUI
 # ---------------------------------------------------------------------------
+
+_gui_root = None  # for hotkey callbacks
+_gui_inp = None
+_gui_ptt: PTTRecorder = None
 
 def run_gui():
     """Main GUI loop (must run in main thread)."""
+    global _gui_root, _gui_inp, _gui_ptt
     import tkinter as tk
 
     root = tk.Tk()
+    _gui_root = root
     root.title(f"{PERSONA_NAME} Aide V4")
     root.geometry(WINDOW_GEOMETRY)
     root.attributes("-topmost", True)
     root.configure(bg="#1e1e2e")
+    root.protocol("WM_DELETE_WINDOW", lambda: _toggle_gui())
 
     # Title
-    tk.Label(root, text=f"{PERSONA_NAME} — V4",
-             bg="#1e1e2e", fg="#cdd6f4", font=("Segoe UI", 11, "bold"),
+    tk.Label(root, text=f"{PERSONA_NAME} — V4  |  Enter=送信 / F10=表示切替 / XButton2=PTT",
+             bg="#1e1e2e", fg="#6c7086", font=("Segoe UI", 8),
              anchor="w").pack(fill="x", padx=10, pady=(8, 0))
 
-    # Input (tk.Text, same as V3 — proven to work on this machine)
+    # Input
     inp = tk.Text(root, height=3, wrap="word",
                   bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
                   font=("Segoe UI", 10), relief="flat", padx=8, pady=6)
     inp.pack(fill="x", padx=10, pady=(6, 0))
+    _gui_inp = inp
 
     # Button frame
     btn_frame = tk.Frame(root, bg="#1e1e2e")
@@ -364,6 +635,7 @@ def run_gui():
         tts_speak(reply)
 
     inp.bind("<Return>", on_send)
+    inp.bind("<Escape>", lambda e: _toggle_gui())
 
     send_btn = tk.Button(btn_frame, text="送信", command=on_send,
                          bg="#89b4fa", fg="#1e1e2e",
@@ -371,21 +643,56 @@ def run_gui():
                          relief="flat", padx=16, pady=2)
     send_btn.pack(side="left")
 
+    # PTT — result goes through _do_send
+    def ptt_result(text: str):
+        root.after(0, lambda: (append_log(f"[PTT] {text}"),))
+        _do_send(text)
+
+    def ptt_status(msg: str):
+        root.after(0, set_status, msg)
+
+    _gui_ptt = PTTRecorder(on_result=ptt_result, on_status=ptt_status)
+
     # Welcome
     root.after(100, lambda: append_log(
-        f"[{PERSONA_NAME}] V4起動完了。テキスト入力で会話できます。"))
+        f"[{PERSONA_NAME}] V4起動完了。テキスト入力 or XButton2で音声入力。"))
 
     # Focus
     root.after(300, lambda: inp.focus_force())
 
+    # Start hotkey thread
+    start_hotkey_thread(
+        on_toggle_gui=lambda: root.after(0, _toggle_gui),
+        on_ptt_start=lambda: root.after(0, _gui_ptt.start),
+        on_ptt_stop=lambda: root.after(0, _gui_ptt.stop),
+    )
+
     root.mainloop()
 
+_gui_visible = True
+
+def _toggle_gui():
+    """Toggle GUI window visibility."""
+    global _gui_visible
+    if _gui_root is None:
+        return
+    if _gui_visible:
+        _gui_root.withdraw()
+        _gui_visible = False
+    else:
+        _gui_root.deiconify()
+        _gui_root.lift()
+        _gui_root.focus_force()
+        if _gui_inp:
+            _gui_inp.focus_force()
+        _gui_visible = True
+
 # ---------------------------------------------------------------------------
-# 9. Main
+# 11. Main
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info("律 Aide V4 starting (Phase 1)")
+    log.info("律 Aide V4 starting (Phase 1+2)")
 
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY is not set. Claude API calls will fail.")
@@ -394,13 +701,16 @@ def main():
     tts_thread = threading.Thread(target=_tts_worker, daemon=True, name="TTS")
     tts_thread.start()
 
-    # Run GUI (blocks in main thread)
+    # Preload STT model in background
+    threading.Thread(target=_get_stt_model, daemon=True, name="STT-init").start()
+
+    # Run GUI (blocks in main thread; hotkeys started inside run_gui)
     try:
         run_gui()
     except KeyboardInterrupt:
         log.info("Shutting down...")
     finally:
-        _tts_queue.put(None)  # signal TTS thread to exit
+        _tts_queue.put(None)
 
     log.info("律 Aide V4 stopped.")
 
