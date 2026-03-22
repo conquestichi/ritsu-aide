@@ -1,4 +1,3 @@
 @echo off
 cd /d "%~dp0"
-python ritsu.py %*
-pause
+python ritsu_v4.py %*
