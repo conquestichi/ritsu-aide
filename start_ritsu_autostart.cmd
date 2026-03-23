@@ -13,7 +13,7 @@ REM VMagicMirror起動 (起動していなければ)
 tasklist /FI "IMAGENAME eq VMagicMirror.exe" 2>NUL | find /I "VMagicMirror.exe" >NUL
 if %ERRORLEVEL% NEQ 0 (
     echo [律] VMagicMirror起動中...
-    start "" "C:\Users\conqu\VMagicMirror_v4.0.1\VMagicMirror.exe"
+    start "" "C:\Program Files (x86)\VMagicMirror\VMagicMirror.exe"
     timeout /t 3 /nobreak >NUL
 )
 
