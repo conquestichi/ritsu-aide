@@ -647,6 +647,23 @@ def _call_claude_kogane_report(trade_info: str) -> dict:
 
 _tts_queue: queue.Queue = queue.Queue()
 
+# Emotion → VOICEVOX audio_query parameter overrides
+# speedScale: 話速 (1.0=標準, 低=ゆっくり)
+# pitchScale: 声の高さ (0.0=標準)
+# intonationScale: 抑揚 (1.0=標準, 高=感情的)
+# prePhonemeLength: 発話前の間 (0.15=標準)
+_EMOTION_TTS_PARAMS: dict[str, dict] = {
+    "happy":   {"speedScale": 1.05, "pitchScale": 0.05, "intonationScale": 1.3},
+    "calm":    {"speedScale": 0.90, "pitchScale": -0.02, "intonationScale": 0.9},
+    "sorry":   {"speedScale": 0.85, "pitchScale": -0.05, "intonationScale": 0.8, "prePhonemeLength": 0.2},
+    "warn":    {"speedScale": 0.95, "pitchScale": 0.02, "intonationScale": 1.2},
+    "think":   {"speedScale": 0.85, "pitchScale": -0.03, "intonationScale": 0.85, "prePhonemeLength": 0.25},
+    "neutral": {},
+}
+
+# Base TTS speed (env override)
+TTS_BASE_SPEED = env_float("RITSU_TTS_SPEED", 0.95)  # デフォルト少しゆっくり
+
 def _tts_worker():
     """Background thread: consume TTS queue, synthesize & play via sounddevice."""
     import numpy as np
@@ -654,18 +671,22 @@ def _tts_worker():
     import sounddevice as sd
 
     while True:
-        text = _tts_queue.get()
-        if text is None:
+        item = _tts_queue.get()
+        if item is None:
             break
         try:
-            _speak_voicevox(text, requests, np, sd)
+            if isinstance(item, tuple):
+                text, emotion = item
+            else:
+                text, emotion = item, "neutral"
+            _speak_voicevox(text, emotion, requests, np, sd)
         except Exception as e:
             log.error("TTS error: %s", e)
         finally:
             _tts_queue.task_done()
 
-def _speak_voicevox(text: str, requests, np, sd):
-    """Synthesize text with VOICEVOX and play."""
+def _speak_voicevox(text: str, emotion: str, requests, np, sd):
+    """Synthesize text with VOICEVOX and play. Adjusts params by emotion."""
     # Audio query
     r = requests.post(
         f"{VOICEVOX_URL}/audio_query",
@@ -674,6 +695,17 @@ def _speak_voicevox(text: str, requests, np, sd):
     )
     r.raise_for_status()
     aq = r.json()
+
+    # Apply base speed
+    aq["speedScale"] = TTS_BASE_SPEED
+
+    # Apply emotion-specific overrides
+    overrides = _EMOTION_TTS_PARAMS.get(emotion, {})
+    for key, val in overrides.items():
+        if key == "speedScale":
+            aq[key] = TTS_BASE_SPEED * val  # base × emotion multiplier
+        else:
+            aq[key] = val
 
     # Synthesis
     r = requests.post(
@@ -717,9 +749,9 @@ def _speak_voicevox(text: str, requests, np, sd):
 
     sd.wait()
 
-def tts_speak(text: str):
-    """Enqueue text for TTS playback."""
-    _tts_queue.put(text)
+def tts_speak(text: str, emotion: str = "neutral"):
+    """Enqueue text for TTS playback with emotion-based voice adjustment."""
+    _tts_queue.put((text, emotion))
 
 # ---------------------------------------------------------------------------
 # 7. STT — faster-whisper (local)
@@ -1354,7 +1386,7 @@ def run_gui():
         time_str = f" ({elapsed:.1f}s)" if elapsed else ""
         log_cb(f"[{PERSONA_NAME}]{tag}{time_str} {reply}")
         root.after(0, set_status, f"{emotion} {elapsed:.1f}s")
-        tts_speak(reply)
+        tts_speak(reply, emotion)
 
     inp.bind("<Return>", on_send)
     inp.bind("<Escape>", lambda e: _toggle_gui())
@@ -1393,7 +1425,7 @@ def run_gui():
     def monologue_speak(text: str, emotion: str):
         tag = f" [{emotion}]" if emotion != "neutral" else ""
         root.after(0, append_log, f"[{PERSONA_NAME}]{tag} {text}")
-        tts_speak(text)
+        tts_speak(text, emotion)
 
     # Start Monologue thread
     if MONOLOGUE_ENABLE or MONOLOGUE_SCHEDULE_ENABLE:
