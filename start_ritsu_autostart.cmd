@@ -1,17 +1,23 @@
 @echo off
-:: 律 Aide V4 自動起動スクリプト
-:: shell:startup に配置して使用
-cd /d "C:\Users\conqu\Desktop\ritsu-aide"
+echo [律] 自動起動開始...
 
-:: VOICEVOX が起動するまで待機
-echo Waiting for VOICEVOX...
-:wait_voicevox
-curl -s http://127.0.0.1:50021/version >nul 2>&1
-if errorlevel 1 (
-    timeout /t 3 /nobreak >nul
-    goto wait_voicevox
+REM VOICEVOX起動 (起動していなければ)
+tasklist /FI "IMAGENAME eq VOICEVOX.exe" 2>NUL | find /I "VOICEVOX.exe" >NUL
+if %ERRORLEVEL% NEQ 0 (
+    echo [律] VOICEVOX起動中...
+    start "" "C:\Users\conqu\AppData\Local\Programs\VOICEVOX\VOICEVOX.exe" --no-gpu
+    timeout /t 8 /nobreak >NUL
 )
-echo VOICEVOX ready.
 
-:: 律 Aide V4 起動
-start "RitsuV4" pythonw ritsu_v4.py
+REM VMagicMirror起動 (起動していなければ)
+tasklist /FI "IMAGENAME eq VMagicMirror.exe" 2>NUL | find /I "VMagicMirror.exe" >NUL
+if %ERRORLEVEL% NEQ 0 (
+    echo [律] VMagicMirror起動中...
+    start "" "C:\Users\conqu\VMagicMirror_v4.0.1\VMagicMirror.exe"
+    timeout /t 3 /nobreak >NUL
+)
+
+REM 律V4起動
+echo [律] ritsu_v4.py 起動...
+cd /d C:\Users\conqu\Desktop\ritsu-aide
+python ritsu_v4.py

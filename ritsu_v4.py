@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""律 Aide V4 — Windows完結・API最小・1ファイル常駐AIアシスタント (Phase 1-3)"""
+"""律 Aide V4 — Windows完結・API最小・1ファイル常駐AIアシスタント (Phase 1-4)"""
 
 import ctypes
 import ctypes.wintypes
@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import socket
 import sqlite3
@@ -93,6 +94,23 @@ STT_DEVICE = env("RITSU_STT_DEVICE", "auto")  # auto/cuda/cpu
 STT_INPUT_DEVICE = env("RITSU_STT_INPUT_DEVICE")  # empty=default, or device index number
 STT_SAMPLE_RATE = 16000
 STT_CHANNELS = 1
+
+# Monologue (idle)
+MONOLOGUE_ENABLE = env_int("RITSU_MONOLOGUE_ENABLE", 0)
+MONOLOGUE_IDLE_SEC = env_int("RITSU_MONOLOGUE_IDLE_SEC", 1200)       # 20分
+MONOLOGUE_COOLDOWN_SEC = env_int("RITSU_MONOLOGUE_COOLDOWN_SEC", 1800)  # 30分
+MONOLOGUE_MAX_PER_DAY = env_int("RITSU_MONOLOGUE_MAX_PER_DAY", 10)
+MONOLOGUE_TIME_RANGE = env("RITSU_MONOLOGUE_TIME_RANGE", "08:00-23:00")
+
+# Monologue (schedule)
+MONOLOGUE_SCHEDULE_ENABLE = env_int("RITSU_MONOLOGUE_SCHEDULE_ENABLE", 0)
+MONOLOGUE_SCHEDULE_PATH = env("RITSU_MONOLOGUE_SCHEDULE_PATH", "monologue_schedule.json")
+MONOLOGUE_SCHEDULE_TOLERANCE_SEC = env_int("RITSU_MONOLOGUE_SCHEDULE_TOLERANCE_SEC", 120)
+
+# Kogane watcher
+KOGANE_ENABLE = env_int("RITSU_KOGANE_ENABLE", 0)
+KOGANE_SNAPSHOT_URL = env("RITSU_KOGANE_SNAPSHOT_URL", "https://ingaquants.jp/api/kogane-snapshot?mode=demo")
+KOGANE_POLL_INTERVAL_SEC = env_int("RITSU_KOGANE_POLL_INTERVAL_SEC", 300)  # 5分
 
 # ---------------------------------------------------------------------------
 # 3. Singleton guard
@@ -475,6 +493,7 @@ _PERSONA_FULL = """## 律（りつ）人格設定
 
 _conversation: list[dict] = []
 _conv_lock = threading.Lock()
+_last_user_interaction: float = time.time()
 
 def _call_claude(user_text: str) -> dict:
     """Call Claude API and return {reply_text, emotion_tag}."""
@@ -551,6 +570,76 @@ def _parse_response_json(raw: str) -> dict:
             pass
     # Fallback: treat entire text as reply
     return {"reply_text": raw, "emotion_tag": "neutral"}
+
+
+def _call_claude_monologue(prompt: str) -> dict:
+    """独り言専用のClaude API呼出し。会話履歴に含めない。"""
+    import anthropic
+    if not ANTHROPIC_API_KEY:
+        return {"reply_text": "", "emotion_tag": "neutral"}
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        system = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
+{_PERSONA_FULL}
+
+## 独り言ルール
+- {PERSONA_CALL_USER}に向けた自然な独り言・ひとりごとを生成する
+- 短く（1-3文）。日常のつぶやき程度
+- 顔文字・絵文字は使わない（TTS読み上げのため）
+- 出力は必ず以下のJSONのみ:
+  {{"reply_text": "独り言テキスト", "emotion_tag": "calm|happy|sorry|warn|think|neutral"}}
+"""
+        summaries = db_get_summaries(2)
+        knowledge = db_get_knowledge(10)
+        if summaries:
+            system += "\n--- 過去の会話要約 ---\n"
+            for s in summaries:
+                system += f"・{s}\n"
+        if knowledge:
+            system += "\n--- 記憶 ---\n"
+            for k in knowledge:
+                system += f"[{k['category']}] {k['content']}\n"
+
+        resp = client.messages.create(
+            model=RITSU_MODEL, max_tokens=256, system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        return _parse_response_json(raw)
+    except Exception as e:
+        log.error("Monologue Claude error: %s", e)
+        return {"reply_text": "", "emotion_tag": "neutral"}
+
+
+def _call_claude_kogane_report(trade_info: str) -> dict:
+    """こがねの取引を律がコメントする。毎回Claude APIで生成（定型文なし）。"""
+    import anthropic
+    if not ANTHROPIC_API_KEY:
+        return {"reply_text": "", "emotion_tag": "neutral"}
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        system = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
+{_PERSONA_FULL}
+
+## こがねトレード報告ルール
+- 妹「こがね」の取引結果を{PERSONA_CALL_USER}に報告する
+- 律はおねえちゃんとして、こがねの様子を心配したり褒めたり呆れたりする
+- こがねが株/トレードをやってるとは直接言わない（「なんかやってるみたい」程度）
+- 勝ちなら嬉しそうに、負けなら心配気味に
+- 短く自然に（2-4文）
+- 顔文字・絵文字は使わない（TTS読み上げのため）
+- 出力は必ず以下のJSONのみ:
+  {{"reply_text": "報告テキスト", "emotion_tag": "calm|happy|sorry|warn|think|neutral"}}
+"""
+        resp = client.messages.create(
+            model=RITSU_MODEL, max_tokens=256, system=system,
+            messages=[{"role": "user", "content": f"こがねの最新状況を報告して:\n{trade_info}"}],
+        )
+        raw = resp.content[0].text.strip()
+        return _parse_response_json(raw)
+    except Exception as e:
+        log.error("Kogane report Claude error: %s", e)
+        return {"reply_text": "", "emotion_tag": "neutral"}
 
 # ---------------------------------------------------------------------------
 # 6. VOICEVOX TTS
@@ -914,6 +1003,280 @@ def start_hotkey_thread(on_toggle_gui=None, on_ptt_start=None, on_ptt_stop=None)
     return t
 
 # ---------------------------------------------------------------------------
+# 9.5 MonologueThread — Schedule + Idle 独り言
+# ---------------------------------------------------------------------------
+
+_STOCK_LINES: list[str] = [
+    "今日あったかい…春だね",
+    "最近コンビニのプリンにハマってる",
+    "朝ごはん食べ忘れた",
+    "爪割れた最悪",
+    "洗濯物干してたら雨降ってきた",
+    "電車で寝過ごした",
+    "今日なんか良いことありそうな予感がする …根拠はないw",
+    "カフェラテ頼んだのにブラック来た 飲むけど",
+    "夜ご飯なに食べよう 毎日これ悩んでる",
+    "お布団から出たくない",
+    "美容院いつ行こう…前髪限界",
+    "今日やる事リスト書いたけど 3つ目で飽きたw",
+    "深夜のポテチは正義",
+    "最近ずっと同じ曲聴いてる",
+    "友達に「最近なにしてるの」って聞かれて 「株…」って言ったら微妙な顔された笑",
+    "休みの日のが早く起きるのなんなの",
+    "スマホの充電10%で気づくタイプ",
+    "新しいリップ買った",
+    "今日1日なにもしてない …いや、生きてただけで偉い",
+    "お風呂沸かしたの忘れてた",
+    "推しの動画見てたら夜更かしした",
+    "服選ぶの面倒で毎日似たような格好してるw",
+    "肩こりがひどい モニター見すぎ",
+    "自炊しようと思って材料だけ買って満足するやつ",
+    "金曜日！！！",
+    "もう3月終わるの早すぎない？",
+    "深夜にアイス買いに行く背徳感すき",
+    "あ、そういえば今日祝日だったw",
+    "急に甘いもの食べたくなった",
+    "寝落ちしてアラーム止めてた",
+    "最近お風呂で寝そうになる…危ない",
+    "土曜なのに癖でチャート開いちゃった 市場やってないのにw",
+    "たまには早く寝る おやすみ",
+    "今日の空きれい",
+    "コンビニの新作スイーツ買ってしまった",
+    "日曜の夜ってなんか切ない",
+    "友達とごはん行った 株の話は封印したw",
+    "お風呂入りながら明日の事考えてた …考えてたけど寝そうになった",
+    "雨の日ってなんか相場も暗い気がするの私だけ？",
+    "夜中に急にチャートが気になって見ちゃう病",
+    "連敗中だけどアイス食べたら少し元気出た",
+    "二度寝した…幸せ",
+    "今日は掃除する…する… たぶん",
+    "あつい",
+    "おなかすいた",
+    "タピオカ久しぶりに飲んだ",
+    "明日月曜か",
+    "マスクどこいった",
+    "夜風が気持ちいい",
+    "今日のおやつはシュークリーム",
+    "傘忘れた",
+    "推しの新曲やばい",
+    "ネイル変えた",
+    "宅配便の再配達忘れてた",
+    "今日やっと届いた荷物開けるの楽しみ",
+    "花粉つらい",
+    "月曜の朝って世界で一番つらい",
+]
+
+
+class MonologueThread:
+    """独り言スレッド: Schedule型 + Idle型を1スレッドで管理"""
+
+    def __init__(self, on_speak):
+        """on_speak(text, emotion_tag): GUI表示+TTS再生のコールバック"""
+        self.on_speak = on_speak
+        self._idle_count_today = 0
+        self._idle_date = ""
+        self._last_monologue_time = 0.0
+        self._fired_schedule_slots: set[str] = set()
+        self._schedule_slots: list[dict] = []
+        self._load_schedule()
+
+    def _load_schedule(self):
+        try:
+            p = Path(MONOLOGUE_SCHEDULE_PATH)
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                self._schedule_slots = data.get("slots", [])
+                log.info("Monologue schedule loaded: %d slots", len(self._schedule_slots))
+        except Exception as e:
+            log.warning("Failed to load monologue schedule: %s", e)
+
+    def _in_time_range(self) -> bool:
+        try:
+            start_s, end_s = MONOLOGUE_TIME_RANGE.split("-")
+            now = datetime.now()
+            sh, sm = map(int, start_s.split(":"))
+            eh, em = map(int, end_s.split(":"))
+            start = now.replace(hour=sh, minute=sm, second=0)
+            end = now.replace(hour=eh, minute=em, second=0)
+            return start <= now <= end
+        except Exception:
+            return True
+
+    def _reset_daily_counter(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._idle_date != today:
+            self._idle_date = today
+            self._idle_count_today = 0
+            self._fired_schedule_slots.clear()
+
+    def _try_schedule(self):
+        """Schedule型: 定時スロットにClaude APIで独り言生成"""
+        if not MONOLOGUE_SCHEDULE_ENABLE or not self._schedule_slots:
+            return
+        now = datetime.now()
+        tolerance = MONOLOGUE_SCHEDULE_TOLERANCE_SEC
+
+        for slot in self._schedule_slots:
+            slot_time = slot.get("time", "")
+            if slot_time in self._fired_schedule_slots:
+                continue
+            try:
+                sh, sm = map(int, slot_time.split(":"))
+                slot_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                diff = abs((now - slot_dt).total_seconds())
+                if diff <= tolerance:
+                    prompt = slot.get("prompt", "独り言を一言")
+                    log.info("Schedule monologue firing: %s", slot_time)
+                    result = _call_claude_monologue(prompt)
+                    text = result.get("reply_text", "")
+                    if text:
+                        self.on_speak(text, result.get("emotion_tag", "neutral"))
+                        self._last_monologue_time = time.time()
+                    self._fired_schedule_slots.add(slot_time)
+            except Exception as e:
+                log.warning("Schedule monologue error for %s: %s", slot_time, e)
+
+    def _try_idle(self):
+        """Idle型: 無操作検知 → 70%ストック / 30%API"""
+        if not MONOLOGUE_ENABLE:
+            return
+        if not self._in_time_range():
+            return
+        if self._idle_count_today >= MONOLOGUE_MAX_PER_DAY:
+            return
+
+        now = time.time()
+        idle_sec = now - _last_user_interaction
+        cooldown = now - self._last_monologue_time
+
+        if idle_sec < MONOLOGUE_IDLE_SEC:
+            return
+        if cooldown < MONOLOGUE_COOLDOWN_SEC:
+            return
+
+        log.info("Idle monologue firing (idle=%.0fs)", idle_sec)
+        if random.random() < 0.7 and _STOCK_LINES:
+            # 70% ストック (API不要)
+            text = random.choice(_STOCK_LINES)
+            emotion = "neutral"
+        else:
+            # 30% API (文脈ある独り言)
+            hour = datetime.now().hour
+            if hour < 12:
+                time_hint = "午前中"
+            elif hour < 18:
+                time_hint = "午後"
+            else:
+                time_hint = "夜"
+            prompt = f"今は{time_hint}。{PERSONA_CALL_USER}がしばらく何も話しかけてこない。独り言を一言つぶやいて。"
+            result = _call_claude_monologue(prompt)
+            text = result.get("reply_text", "")
+            emotion = result.get("emotion_tag", "neutral")
+
+        if text:
+            self.on_speak(text, emotion)
+            self._idle_count_today += 1
+            self._last_monologue_time = time.time()
+
+    def run(self):
+        """メインループ (daemonスレッドで呼ぶ)"""
+        log.info("MonologueThread started (idle=%s, schedule=%s)",
+                 bool(MONOLOGUE_ENABLE), bool(MONOLOGUE_SCHEDULE_ENABLE))
+        while True:
+            try:
+                self._reset_daily_counter()
+                self._try_schedule()
+                self._try_idle()
+            except Exception as e:
+                log.error("MonologueThread error: %s", e)
+            time.sleep(30)
+
+# ---------------------------------------------------------------------------
+# 9.6 KoganeWatcherThread — こがねトレード監視・報告
+# ---------------------------------------------------------------------------
+
+
+class KoganeWatcherThread:
+    """こがねトレード監視 → 新規取引検知 → 律がコメント"""
+
+    def __init__(self, on_speak):
+        self.on_speak = on_speak
+        self._seen_trades: set[str] = set()
+        self._initialized = False
+
+    def _fetch_snapshot(self) -> dict | None:
+        import requests as req
+        try:
+            resp = req.get(KOGANE_SNAPSHOT_URL, timeout=10)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            log.debug("Kogane snapshot fetch error: %s", e)
+        return None
+
+    def _check_new_trades(self, data: dict):
+        trades = data.get("recent_trades", [])
+        if not trades:
+            return
+
+        # 初回は既存取引を記録するだけ（起動時に全部報告しない）
+        if not self._initialized:
+            for t in trades:
+                key = f"{t.get('ticker', '')}:{t.get('date', '')}"
+                self._seen_trades.add(key)
+            self._initialized = True
+            log.info("Kogane watcher initialized: %d existing trades tracked", len(self._seen_trades))
+            return
+
+        new_trades = []
+        for t in trades:
+            key = f"{t.get('ticker', '')}:{t.get('date', '')}"
+            if key not in self._seen_trades:
+                self._seen_trades.add(key)
+                new_trades.append(t)
+
+        if not new_trades:
+            return
+
+        log.info("Kogane: %d new trade(s) detected", len(new_trades))
+        lines = []
+        for t in new_trades:
+            ticker = t.get("ticker", "?")
+            name = t.get("name", "")
+            ret = t.get("return_pct")
+            date_str = t.get("date", "")
+            reason = t.get("exit_reason", "")
+            ret_str = f"{ret:+.1f}%" if ret is not None else "不明"
+            name_str = f" ({name})" if name else ""
+            lines.append(f"- {ticker}{name_str}: {ret_str} [{reason}] ({date_str})")
+
+        trade_info = "\n".join(lines)
+
+        perf = data.get("performance", {})
+        win_rate = perf.get("win_rate")
+        total_ret = perf.get("total_return_pct")
+        n_trades = perf.get("n_trades")
+        if win_rate is not None:
+            trade_info += f"\n\n通算: {n_trades}回取引, 勝率{win_rate}%, 累計リターン{total_ret:+.1f}%"
+
+        result = _call_claude_kogane_report(trade_info)
+        text = result.get("reply_text", "")
+        if text:
+            self.on_speak(text, result.get("emotion_tag", "neutral"))
+
+    def run(self):
+        log.info("KoganeWatcherThread started (url=%s, interval=%ds)",
+                 KOGANE_SNAPSHOT_URL, KOGANE_POLL_INTERVAL_SEC)
+        while True:
+            try:
+                data = self._fetch_snapshot()
+                if data:
+                    self._check_new_trades(data)
+            except Exception as e:
+                log.error("KoganeWatcher error: %s", e)
+            time.sleep(KOGANE_POLL_INTERVAL_SEC)
+
+# ---------------------------------------------------------------------------
 # 10. tkinter GUI
 # ---------------------------------------------------------------------------
 
@@ -979,6 +1342,8 @@ def run_gui():
         return "break"
 
     def _do_send(text: str):
+        global _last_user_interaction
+        _last_user_interaction = time.time()
         log_cb = lambda m: root.after(0, append_log, m)
         log_cb(f"[{PERSONA_CALL_USER}] {text}")
         result = _call_claude(text)
@@ -1024,6 +1389,22 @@ def run_gui():
         on_ptt_stop=lambda: root.after(0, _gui_ptt.stop),
     )
 
+    # Monologue / Kogane speak callback
+    def monologue_speak(text: str, emotion: str):
+        tag = f" [{emotion}]" if emotion != "neutral" else ""
+        root.after(0, append_log, f"[{PERSONA_NAME}]{tag} {text}")
+        tts_speak(text)
+
+    # Start Monologue thread
+    if MONOLOGUE_ENABLE or MONOLOGUE_SCHEDULE_ENABLE:
+        mono = MonologueThread(on_speak=monologue_speak)
+        threading.Thread(target=mono.run, daemon=True, name="Monologue").start()
+
+    # Start Kogane watcher thread
+    if KOGANE_ENABLE:
+        kogane = KoganeWatcherThread(on_speak=monologue_speak)
+        threading.Thread(target=kogane.run, daemon=True, name="KoganeWatcher").start()
+
     root.mainloop()
 
 _gui_visible = True
@@ -1049,7 +1430,7 @@ def _toggle_gui():
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info("律 Aide V4 starting (Phase 1-3)")
+    log.info("律 Aide V4 starting (Phase 1-4)")
 
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY is not set. Claude API calls will fail.")
