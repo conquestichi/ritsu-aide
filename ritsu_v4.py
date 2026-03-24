@@ -111,6 +111,9 @@ MONOLOGUE_SCHEDULE_TOLERANCE_SEC = env_int("RITSU_MONOLOGUE_SCHEDULE_TOLERANCE_S
 KOGANE_ENABLE = env_int("RITSU_KOGANE_ENABLE", 0)
 KOGANE_SNAPSHOT_URL = env("RITSU_KOGANE_SNAPSHOT_URL", "https://ingaquants.jp/api/kogane-snapshot?mode=demo")
 KOGANE_POLL_INTERVAL_SEC = env_int("RITSU_KOGANE_POLL_INTERVAL_SEC", 300)  # 5分
+KOGANE_TTS_SPEAKER_STYLE_ID = env_int("RITSU_KOGANE_TTS_SPEAKER_STYLE_ID", 6)  # 四国めたん(ツンツン)
+KOGANE_MESSAGES_URL = env("RITSU_KOGANE_MESSAGES_URL", "")  # https://inga-quants.com/api/kogane-messages
+KOGANE_MESSAGES_POLL_SEC = env_int("RITSU_KOGANE_MESSAGES_POLL_SEC", 30)
 
 # ---------------------------------------------------------------------------
 # 3. Singleton guard
@@ -676,21 +679,26 @@ def _tts_worker():
             break
         try:
             if isinstance(item, tuple):
-                text, emotion = item
+                if len(item) == 3:
+                    text, emotion, speaker = item
+                else:
+                    text, emotion = item
+                    speaker = None
             else:
-                text, emotion = item, "neutral"
-            _speak_voicevox(text, emotion, requests, np, sd)
+                text, emotion, speaker = item, "neutral", None
+            _speak_voicevox(text, emotion, requests, np, sd, speaker=speaker)
         except Exception as e:
             log.error("TTS error: %s", e)
         finally:
             _tts_queue.task_done()
 
-def _speak_voicevox(text: str, emotion: str, requests, np, sd):
+def _speak_voicevox(text: str, emotion: str, requests, np, sd, speaker: int | None = None):
     """Synthesize text with VOICEVOX and play. Adjusts params by emotion."""
+    spk = speaker if speaker is not None else TTS_SPEAKER_STYLE_ID
     # Audio query
     r = requests.post(
         f"{VOICEVOX_URL}/audio_query",
-        params={"text": text, "speaker": TTS_SPEAKER_STYLE_ID},
+        params={"text": text, "speaker": spk},
         timeout=10,
     )
     r.raise_for_status()
@@ -710,7 +718,7 @@ def _speak_voicevox(text: str, emotion: str, requests, np, sd):
     # Synthesis
     r = requests.post(
         f"{VOICEVOX_URL}/synthesis",
-        params={"speaker": TTS_SPEAKER_STYLE_ID},
+        params={"speaker": spk},
         json=aq,
         timeout=30,
     )
@@ -749,9 +757,11 @@ def _speak_voicevox(text: str, emotion: str, requests, np, sd):
 
     sd.wait()
 
-def tts_speak(text: str, emotion: str = "neutral"):
-    """Enqueue text for TTS playback with emotion-based voice adjustment."""
-    _tts_queue.put((text, emotion))
+def tts_speak(text: str, emotion: str = "neutral", speaker: int | None = None):
+    """Enqueue text for TTS playback with emotion-based voice adjustment.
+    speaker: VOICEVOX speaker ID override. None=律(デフォルト), 6=こがね等。
+    """
+    _tts_queue.put((text, emotion, speaker))
 
 # ---------------------------------------------------------------------------
 # 7. STT — faster-whisper (local)
@@ -1229,12 +1239,15 @@ class MonologueThread:
 
 
 class KoganeWatcherThread:
-    """こがねトレード監視 → 新規取引検知 → 律がコメント"""
+    """こがねトレード監視 → 新規取引検知 → 律がコメント
+       + こがねLINE発言検知 → こがねの声でTTS再生"""
 
     def __init__(self, on_speak):
-        self.on_speak = on_speak
+        self.on_speak = on_speak  # callback(text, emotion, speaker=None)
         self._seen_trades: set[str] = set()
         self._initialized = False
+        self._last_msg_ts = 0  # 最後に見たこがねメッセージのタイムスタンプ
+        self._msg_initialized = False
 
     def _fetch_snapshot(self) -> dict | None:
         import requests as req
@@ -1296,17 +1309,69 @@ class KoganeWatcherThread:
         if text:
             self.on_speak(text, result.get("emotion_tag", "neutral"))
 
+    def _check_new_messages(self):
+        """こがねLINE会話の新着発言を検知 → こがねの声でTTS再生。"""
+        if not KOGANE_MESSAGES_URL:
+            return
+        import requests as req
+        try:
+            resp = req.get(KOGANE_MESSAGES_URL, timeout=10)
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            messages = data.get("messages", [])
+            if not messages:
+                return
+
+            # 初回は既存メッセージを記録するだけ
+            if not self._msg_initialized:
+                self._last_msg_ts = messages[-1].get("ts", 0) if messages else 0
+                self._msg_initialized = True
+                log.info("Kogane messages initialized (last_ts=%d)", self._last_msg_ts)
+                return
+
+            # 新着のこがね発言だけ抽出
+            for msg in messages:
+                ts = msg.get("ts", 0)
+                if ts > self._last_msg_ts and msg.get("role") == "assistant":
+                    text = msg.get("content", "")
+                    if text:
+                        log.info("Kogane new message: %s", text[:50])
+                        tts_speak(text, "neutral", speaker=KOGANE_TTS_SPEAKER_STYLE_ID)
+
+            # 最新tsを更新
+            latest_ts = messages[-1].get("ts", 0)
+            if latest_ts > self._last_msg_ts:
+                self._last_msg_ts = latest_ts
+
+        except Exception as e:
+            log.debug("Kogane messages fetch error: %s", e)
+
     def run(self):
-        log.info("KoganeWatcherThread started (url=%s, interval=%ds)",
-                 KOGANE_SNAPSHOT_URL, KOGANE_POLL_INTERVAL_SEC)
+        log.info("KoganeWatcherThread started (url=%s, interval=%ds, messages=%s)",
+                 KOGANE_SNAPSHOT_URL, KOGANE_POLL_INTERVAL_SEC,
+                 KOGANE_MESSAGES_URL or "disabled")
+        msg_counter = 0
         while True:
             try:
+                # トレード監視（5分間隔）
                 data = self._fetch_snapshot()
                 if data:
                     self._check_new_trades(data)
             except Exception as e:
                 log.error("KoganeWatcher error: %s", e)
-            time.sleep(KOGANE_POLL_INTERVAL_SEC)
+
+            # メッセージ監視（KOGANE_MESSAGES_POLL_SEC間隔、sleepをsnapshotと共有）
+            if KOGANE_MESSAGES_URL:
+                polls_per_snapshot = max(1, KOGANE_POLL_INTERVAL_SEC // KOGANE_MESSAGES_POLL_SEC)
+                for _ in range(polls_per_snapshot):
+                    try:
+                        self._check_new_messages()
+                    except Exception as e:
+                        log.debug("KoganeWatcher msg error: %s", e)
+                    time.sleep(KOGANE_MESSAGES_POLL_SEC)
+            else:
+                time.sleep(KOGANE_POLL_INTERVAL_SEC)
 
 # ---------------------------------------------------------------------------
 # 10. tkinter GUI
