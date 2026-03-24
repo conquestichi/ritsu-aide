@@ -1,0 +1,15 @@
+[Unit]
+Description=Ritsu LINE Chat Server
+After=network.target
+
+[Service]
+Type=simple
+User=inga
+WorkingDirectory=/opt/ritsu-line
+EnvironmentFile=/opt/ritsu-line/.env
+ExecStart=/opt/inga-kogane/.venv/bin/python /opt/ritsu-line/ritsu_line.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
