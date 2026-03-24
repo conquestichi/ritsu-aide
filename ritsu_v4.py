@@ -1256,7 +1256,7 @@ class KoganeWatcherThread:
             if resp.status_code == 200:
                 return resp.json()
         except Exception as e:
-            log.debug("Kogane snapshot fetch error: %s", e)
+            log.info("Kogane snapshot fetch error: %s", e)
         return None
 
     def _check_new_trades(self, data: dict):
@@ -1317,6 +1317,7 @@ class KoganeWatcherThread:
         try:
             resp = req.get(KOGANE_MESSAGES_URL, timeout=10)
             if resp.status_code != 200:
+                log.warning("Kogane messages HTTP %d", resp.status_code)
                 return
             data = resp.json()
             messages = data.get("messages", [])
@@ -1327,7 +1328,7 @@ class KoganeWatcherThread:
             if not self._msg_initialized:
                 self._last_msg_ts = messages[-1].get("ts", 0) if messages else 0
                 self._msg_initialized = True
-                log.info("Kogane messages initialized (last_ts=%d)", self._last_msg_ts)
+                log.info("Kogane messages initialized (last_ts=%d, count=%d)", self._last_msg_ts, len(messages))
                 return
 
             # 新着のこがね発言だけ抽出
@@ -1336,7 +1337,7 @@ class KoganeWatcherThread:
                 if ts > self._last_msg_ts and msg.get("role") == "assistant":
                     text = msg.get("content", "")
                     if text:
-                        log.info("Kogane new message: %s", text[:50])
+                        log.info("Kogane new message (speaker=%d): %s", KOGANE_TTS_SPEAKER_STYLE_ID, text[:50])
                         tts_speak(text, "neutral", speaker=KOGANE_TTS_SPEAKER_STYLE_ID)
 
             # 最新tsを更新
@@ -1345,7 +1346,7 @@ class KoganeWatcherThread:
                 self._last_msg_ts = latest_ts
 
         except Exception as e:
-            log.debug("Kogane messages fetch error: %s", e)
+            log.info("Kogane messages fetch error: %s", e)
 
     def run(self):
         log.info("KoganeWatcherThread started (url=%s, interval=%ds, messages=%s)",
@@ -1368,7 +1369,7 @@ class KoganeWatcherThread:
                     try:
                         self._check_new_messages()
                     except Exception as e:
-                        log.debug("KoganeWatcher msg error: %s", e)
+                        log.info("KoganeWatcher msg error: %s", e)
                     time.sleep(KOGANE_MESSAGES_POLL_SEC)
             else:
                 time.sleep(KOGANE_POLL_INTERVAL_SEC)
