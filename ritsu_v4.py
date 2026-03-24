@@ -115,6 +115,11 @@ KOGANE_TTS_SPEAKER_STYLE_ID = env_int("RITSU_KOGANE_TTS_SPEAKER_STYLE_ID", 46)  
 KOGANE_MESSAGES_URL = env("RITSU_KOGANE_MESSAGES_URL", "")  # https://inga-quants.com/api/kogane-messages
 KOGANE_MESSAGES_POLL_SEC = env_int("RITSU_KOGANE_MESSAGES_POLL_SEC", 30)
 
+# Shared knowledge sync
+SHARED_KNOWLEDGE_URL = env("RITSU_SHARED_KNOWLEDGE_URL", "")  # https://ingaquants.jp/api/shared-knowledge
+SHARED_KNOWLEDGE_TOKEN = env("RITSU_SHARED_KNOWLEDGE_TOKEN", "")
+SHARED_KNOWLEDGE_SYNC_SEC = env_int("RITSU_SHARED_KNOWLEDGE_SYNC_SEC", 600)  # 10分
+
 # ---------------------------------------------------------------------------
 # 3. Singleton guard
 # ---------------------------------------------------------------------------
@@ -340,9 +345,80 @@ JSON配列で返してください: [{"category":"fact|preference|decision|memo"
         raw = resp.content[0].text.strip()
         items = json.loads(raw) if raw.startswith("[") else []
         for item in items[:5]:
-            db_save_knowledge(item.get("content", ""), item.get("category", "fact"), "auto")
+            content = item.get("content", "")
+            category = item.get("category", "fact")
+            db_save_knowledge(content, category, "auto")
+            # 共有知識DBにもpush
+            _shared_knowledge_push(content, category)
     except Exception as e:
         log.error("Knowledge extraction error: %s", e)
+
+
+# --- Shared knowledge sync (VPS ↔ Desktop) ---
+
+_shared_knowledge_cache: list[dict] = []
+_shared_knowledge_lock = threading.Lock()
+
+
+def _shared_knowledge_pull():
+    """VPSの共有知識DBからpull → キャッシュ更新。"""
+    if not SHARED_KNOWLEDGE_URL or not SHARED_KNOWLEDGE_TOKEN:
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            SHARED_KNOWLEDGE_URL,
+            headers={"Authorization": f"Bearer {SHARED_KNOWLEDGE_TOKEN}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            items = data.get("knowledge", [])
+            with _shared_knowledge_lock:
+                _shared_knowledge_cache.clear()
+                _shared_knowledge_cache.extend(items)
+            log.info("Shared knowledge pulled: %d items", len(items))
+    except Exception as e:
+        log.debug("Shared knowledge pull error: %s", e)
+
+
+def _shared_knowledge_push(content: str, category: str = "fact"):
+    """VPSの共有知識DBにpush（1件）。"""
+    if not SHARED_KNOWLEDGE_URL or not SHARED_KNOWLEDGE_TOKEN:
+        return
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "items": [{"content": content, "category": category,
+                        "source": "auto", "source_persona": "ritsu_desktop"}]
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            SHARED_KNOWLEDGE_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {SHARED_KNOWLEDGE_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass
+    except Exception as e:
+        log.debug("Shared knowledge push error: %s", e)
+
+
+def _shared_knowledge_get() -> list[dict]:
+    """キャッシュから共有知識を取得。"""
+    with _shared_knowledge_lock:
+        return list(_shared_knowledge_cache)
+
+
+def _shared_knowledge_sync_loop():
+    """バックグラウンドで定期的にpull。"""
+    log.info("Shared knowledge sync started (url=%s, interval=%ds)",
+             SHARED_KNOWLEDGE_URL, SHARED_KNOWLEDGE_SYNC_SEC)
+    while True:
+        _shared_knowledge_pull()
+        time.sleep(SHARED_KNOWLEDGE_SYNC_SEC)
 
 # --- Explicit memory commands ---
 
@@ -352,6 +428,7 @@ def handle_memory_command(text: str) -> Optional[str]:
         content = text.split(":", 1)[-1].split("：", 1)[-1].strip()
         if content:
             db_save_knowledge(content, "memo", "explicit", 1.0)
+            _shared_knowledge_push(content, "memo")
             return f"覚えました: {content}"
         return "内容が空です。"
 
@@ -396,12 +473,23 @@ reply_text は律の口調・性格で書くこと。顔文字・絵文字は使
         for s in summaries:
             base += f"・{s}\n"
 
-    # Inject knowledge
+    # Inject knowledge (local)
     knowledge = db_get_knowledge(20)
     if knowledge:
         base += "\n--- 記憶している事実 ---\n"
         for k in knowledge:
             base += f"[{k['category']}] {k['content']}\n"
+
+    # Inject shared knowledge (VPS — 律+こがね共有)
+    shared = _shared_knowledge_get()
+    if shared:
+        # ローカルと重複除去
+        local_contents = {k['content'] for k in knowledge} if knowledge else set()
+        shared_new = [s for s in shared if s['content'] not in local_contents]
+        if shared_new:
+            base += "\n--- 共有知識（姉妹間）---\n"
+            for s in shared_new[:20]:
+                base += f"[{s['category']}] {s['content']}\n"
 
     return base
 
@@ -1502,6 +1590,11 @@ def run_gui():
         threading.Thread(target=kogane.run_trades, daemon=True, name="KoganeTradeWatcher").start()
         if KOGANE_MESSAGES_URL:
             threading.Thread(target=kogane.run_messages, daemon=True, name="KoganeMessageWatcher").start()
+
+    # Start shared knowledge sync
+    if SHARED_KNOWLEDGE_URL and SHARED_KNOWLEDGE_TOKEN:
+        _shared_knowledge_pull()  # 初回即pull
+        threading.Thread(target=_shared_knowledge_sync_loop, daemon=True, name="SharedKnowledgeSync").start()
 
     root.mainloop()
 

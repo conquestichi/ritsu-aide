@@ -44,6 +44,7 @@ BASE_DIR = Path(os.environ.get("RITSU_LINE_BASE", "/opt/ritsu-line"))
 CHAT_DB_PATH = BASE_DIR / "data" / "ritsu-chat.db"
 LATEST_MSG_PATH = BASE_DIR / "data" / "latest_ritsu_messages.json"
 COOLDOWN_SEC = 5
+KNOWLEDGE_API_TOKEN = os.environ.get("RITSU_KNOWLEDGE_API_TOKEN", "")
 
 # ── 個別記憶DB（turns/summaries — 律専用）──
 
@@ -415,11 +416,52 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode("utf-8"))
 
-    def do_POST(self):
-        if self.path != "/webhook/ritsu":
-            self._respond(404, "not found")
-            return
+    def _respond_json(self, status: int, data: dict):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
+    def _check_api_token(self) -> bool:
+        if not KNOWLEDGE_API_TOKEN:
+            return False
+        auth = self.headers.get("Authorization", "")
+        return auth == f"Bearer {KNOWLEDGE_API_TOKEN}"
+
+    def do_POST(self):
+        if self.path == "/webhook/ritsu":
+            self._handle_webhook()
+        elif self.path == "/api/shared-knowledge":
+            self._handle_post_knowledge()
+        else:
+            self._respond(404, "not found")
+
+    def _handle_post_knowledge(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+            items = body.get("items", [])
+            added = 0
+            for item in items:
+                content = item.get("content", "").strip()
+                if content:
+                    sk_save(
+                        content,
+                        category=item.get("category", "fact"),
+                        source=item.get("source", "auto"),
+                        source_persona=item.get("source_persona", "ritsu_desktop"),
+                        confidence=item.get("confidence", 0.8),
+                    )
+                    added += 1
+            self._respond_json(200, {"added": added})
+        except Exception as e:
+            logger.error("POST shared-knowledge error: %s", e)
+            self._respond_json(500, {"error": str(e)})
+
+    def _handle_webhook(self):
         signature = self.headers.get("x-line-signature", "")
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
@@ -446,8 +488,21 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._respond(200, "ok")
+        elif self.path == "/api/shared-knowledge":
+            self._handle_get_knowledge()
         else:
             self._respond(404, "not found")
+
+    def _handle_get_knowledge(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            knowledge = sk_get(limit=200)
+            self._respond_json(200, {"knowledge": knowledge})
+        except Exception as e:
+            logger.error("GET shared-knowledge error: %s", e)
+            self._respond_json(500, {"error": str(e)})
 
 
 def _handle_text_message(event: dict):
