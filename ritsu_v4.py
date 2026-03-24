@@ -1136,65 +1136,98 @@ def start_hotkey_thread(on_toggle_gui=None, on_ptt_start=None, on_ptt_stop=None)
 # 9.5 MonologueThread — Schedule + Idle 独り言
 # ---------------------------------------------------------------------------
 
-_STOCK_LINES: list[str] = [
-    "今日あったかい…春だね",
-    "最近コンビニのプリンにハマってる",
-    "朝ごはん食べ忘れた",
-    "爪割れた最悪",
-    "洗濯物干してたら雨降ってきた",
-    "電車で寝過ごした",
-    "今日なんか良いことありそうな予感がする …根拠はないw",
-    "カフェラテ頼んだのにブラック来た 飲むけど",
-    "夜ご飯なに食べよう 毎日これ悩んでる",
-    "お布団から出たくない",
-    "美容院いつ行こう…前髪限界",
-    "今日やる事リスト書いたけど 3つ目で飽きたw",
-    "深夜のポテチは正義",
-    "最近ずっと同じ曲聴いてる",
-    "友達に「最近なにしてるの」って聞かれて 「株…」って言ったら微妙な顔された笑",
-    "休みの日のが早く起きるのなんなの",
-    "スマホの充電10%で気づくタイプ",
-    "新しいリップ買った",
-    "今日1日なにもしてない …いや、生きてただけで偉い",
-    "お風呂沸かしたの忘れてた",
-    "推しの動画見てたら夜更かしした",
-    "服選ぶの面倒で毎日似たような格好してるw",
-    "肩こりがひどい モニター見すぎ",
-    "自炊しようと思って材料だけ買って満足するやつ",
-    "金曜日！！！",
-    "もう3月終わるの早すぎない？",
-    "深夜にアイス買いに行く背徳感すき",
-    "あ、そういえば今日祝日だったw",
-    "急に甘いもの食べたくなった",
-    "寝落ちしてアラーム止めてた",
-    "最近お風呂で寝そうになる…危ない",
-    "土曜なのに癖でチャート開いちゃった 市場やってないのにw",
-    "たまには早く寝る おやすみ",
-    "今日の空きれい",
-    "コンビニの新作スイーツ買ってしまった",
-    "日曜の夜ってなんか切ない",
-    "友達とごはん行った 株の話は封印したw",
-    "お風呂入りながら明日の事考えてた …考えてたけど寝そうになった",
-    "雨の日ってなんか相場も暗い気がするの私だけ？",
-    "夜中に急にチャートが気になって見ちゃう病",
-    "連敗中だけどアイス食べたら少し元気出た",
-    "二度寝した…幸せ",
-    "今日は掃除する…する… たぶん",
-    "あつい",
-    "おなかすいた",
-    "タピオカ久しぶりに飲んだ",
-    "明日月曜か",
-    "マスクどこいった",
-    "夜風が気持ちいい",
-    "今日のおやつはシュークリーム",
-    "傘忘れた",
-    "推しの新曲やばい",
-    "ネイル変えた",
-    "宅配便の再配達忘れてた",
-    "今日やっと届いた荷物開けるの楽しみ",
-    "花粉つらい",
-    "月曜の朝って世界で一番つらい",
+# hours=(start,end) 0-23 inclusive range, None=any hour
+# weekdays=list of ints (0=Mon..6=Sun), None=any day
+_STOCK_LINES: list[dict] = [
+    # --- 朝 (6-11) ---
+    {"text": "朝ごはん食べ忘れた", "hours": (6, 11), "weekdays": None},
+    {"text": "お布団から出たくない", "hours": (6, 10), "weekdays": None},
+    {"text": "二度寝した…幸せ", "hours": (6, 11), "weekdays": None},
+    {"text": "寝落ちしてアラーム止めてた", "hours": (6, 11), "weekdays": None},
+    {"text": "電車で寝過ごした", "hours": (7, 11), "weekdays": [0, 1, 2, 3, 4]},
+    # --- 昼 (11-14) ---
+    {"text": "おなかすいた", "hours": (11, 14), "weekdays": None},
+    # --- 午後 (12-17) ---
+    {"text": "今日のおやつはシュークリーム", "hours": (14, 17), "weekdays": None},
+    {"text": "今日やる事リスト書いたけど 3つ目で飽きたw", "hours": (9, 17), "weekdays": None},
+    {"text": "肩こりがひどい モニター見すぎ", "hours": (12, 22), "weekdays": None},
+    {"text": "今日の空きれい", "hours": (8, 17), "weekdays": None},
+    # --- 夕方〜夜 (17-23) ---
+    {"text": "夜ご飯なに食べよう 毎日これ悩んでる", "hours": (16, 20), "weekdays": None},
+    {"text": "夜風が気持ちいい", "hours": (18, 23), "weekdays": None},
+    {"text": "お風呂沸かしたの忘れてた", "hours": (19, 23), "weekdays": None},
+    {"text": "お風呂入りながら明日の事考えてた …考えてたけど寝そうになった", "hours": (20, 23), "weekdays": None},
+    {"text": "たまには早く寝る おやすみ", "hours": (21, 23), "weekdays": None},
+    {"text": "最近お風呂で寝そうになる…危ない", "hours": (20, 23), "weekdays": None},
+    {"text": "推しの動画見てたら夜更かしした", "hours": (20, 23), "weekdays": None},
+    {"text": "深夜のポテチは正義", "hours": (21, 23), "weekdays": None},
+    {"text": "深夜にアイス買いに行く背徳感すき", "hours": (21, 23), "weekdays": None},
+    {"text": "夜中に急にチャートが気になって見ちゃう病", "hours": (21, 23), "weekdays": [0, 1, 2, 3, 4]},
+    # --- 曜日限定 ---
+    {"text": "金曜日！！！", "hours": (8, 23), "weekdays": [4]},
+    {"text": "土曜なのに癖でチャート開いちゃった 市場やってないのにw", "hours": (8, 14), "weekdays": [5]},
+    {"text": "日曜の夜ってなんか切ない", "hours": (18, 23), "weekdays": [6]},
+    {"text": "明日月曜か", "hours": (17, 23), "weekdays": [6]},
+    {"text": "月曜の朝って世界で一番つらい", "hours": (6, 11), "weekdays": [0]},
+    {"text": "休みの日のが早く起きるのなんなの", "hours": (6, 10), "weekdays": [5, 6]},
+    {"text": "今日は掃除する…する… たぶん", "hours": (8, 15), "weekdays": [5, 6]},
+    {"text": "友達とごはん行った 株の話は封印したw", "hours": (18, 23), "weekdays": [4, 5, 6]},
+    # --- 平日限定 ---
+    {"text": "雨の日ってなんか相場も暗い気がするの私だけ？", "hours": (9, 16), "weekdays": [0, 1, 2, 3, 4]},
+    {"text": "連敗中だけどアイス食べたら少し元気出た", "hours": (15, 22), "weekdays": [0, 1, 2, 3, 4]},
+    # --- 終日OK ---
+    {"text": "今日あったかい…春だね", "hours": (8, 18), "weekdays": None},
+    {"text": "最近コンビニのプリンにハマってる", "hours": None, "weekdays": None},
+    {"text": "爪割れた最悪", "hours": None, "weekdays": None},
+    {"text": "洗濯物干してたら雨降ってきた", "hours": (8, 18), "weekdays": None},
+    {"text": "今日なんか良いことありそうな予感がする …根拠はないw", "hours": (8, 14), "weekdays": None},
+    {"text": "カフェラテ頼んだのにブラック来た 飲むけど", "hours": (8, 16), "weekdays": None},
+    {"text": "美容院いつ行こう…前髪限界", "hours": None, "weekdays": None},
+    {"text": "最近ずっと同じ曲聴いてる", "hours": None, "weekdays": None},
+    {"text": "友達に「最近なにしてるの」って聞かれて 「株…」って言ったら微妙な顔された笑", "hours": None, "weekdays": None},
+    {"text": "スマホの充電10%で気づくタイプ", "hours": None, "weekdays": None},
+    {"text": "新しいリップ買った", "hours": None, "weekdays": None},
+    {"text": "今日1日なにもしてない …いや、生きてただけで偉い", "hours": (18, 23), "weekdays": None},
+    {"text": "服選ぶの面倒で毎日似たような格好してるw", "hours": (7, 12), "weekdays": None},
+    {"text": "自炊しようと思って材料だけ買って満足するやつ", "hours": None, "weekdays": None},
+    {"text": "もう3月終わるの早すぎない？", "hours": None, "weekdays": None},
+    {"text": "急に甘いもの食べたくなった", "hours": (14, 22), "weekdays": None},
+    {"text": "コンビニの新作スイーツ買ってしまった", "hours": None, "weekdays": None},
+    {"text": "あつい", "hours": (10, 18), "weekdays": None},
+    {"text": "タピオカ久しぶりに飲んだ", "hours": None, "weekdays": None},
+    {"text": "マスクどこいった", "hours": (7, 12), "weekdays": None},
+    {"text": "傘忘れた", "hours": (8, 14), "weekdays": None},
+    {"text": "推しの新曲やばい", "hours": None, "weekdays": None},
+    {"text": "ネイル変えた", "hours": None, "weekdays": None},
+    {"text": "宅配便の再配達忘れてた", "hours": None, "weekdays": None},
+    {"text": "今日やっと届いた荷物開けるの楽しみ", "hours": None, "weekdays": None},
+    {"text": "花粉つらい", "hours": (8, 18), "weekdays": None},
+    {"text": "あ、そういえば今日祝日だったw", "hours": (8, 14), "weekdays": None},
 ]
+
+_WEEKDAY_NAMES = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+
+
+def _filter_stock_lines() -> list[str]:
+    """現在時刻・曜日に合うストックラインだけ返す。"""
+    now = datetime.now()
+    hour = now.hour
+    wd = now.weekday()  # 0=Mon..6=Sun
+    matched = []
+    for entry in _STOCK_LINES:
+        # hours filter
+        h_range = entry.get("hours")
+        if h_range is not None:
+            h_start, h_end = h_range
+            if not (h_start <= hour <= h_end):
+                continue
+        # weekday filter
+        w_list = entry.get("weekdays")
+        if w_list is not None:
+            if wd not in w_list:
+                continue
+        matched.append(entry["text"])
+    return matched
 
 
 class MonologueThread:
@@ -1256,6 +1289,8 @@ class MonologueThread:
                 diff = abs((now - slot_dt).total_seconds())
                 if diff <= tolerance:
                     prompt = slot.get("prompt", "独り言を一言")
+                    wd_name = _WEEKDAY_NAMES[now.weekday()]
+                    prompt = f"今日は{wd_name}。{prompt}"
                     log.info("Schedule monologue firing: %s", slot_time)
                     result = _call_claude_monologue(prompt)
                     text = result.get("reply_text", "")
@@ -1285,20 +1320,23 @@ class MonologueThread:
             return
 
         log.info("Idle monologue firing (idle=%.0fs)", idle_sec)
-        if random.random() < 0.7 and _STOCK_LINES:
-            # 70% ストック (API不要)
-            text = random.choice(_STOCK_LINES)
+        filtered = _filter_stock_lines()
+        if random.random() < 0.7 and filtered:
+            # 70% ストック (API不要, 時刻・曜日フィルタ済み)
+            text = random.choice(filtered)
             emotion = "neutral"
         else:
             # 30% API (文脈ある独り言)
-            hour = datetime.now().hour
+            now_dt = datetime.now()
+            hour = now_dt.hour
             if hour < 12:
                 time_hint = "午前中"
             elif hour < 18:
                 time_hint = "午後"
             else:
                 time_hint = "夜"
-            prompt = f"今は{time_hint}。{PERSONA_CALL_USER}がしばらく何も話しかけてこない。独り言を一言つぶやいて。"
+            wd_name = _WEEKDAY_NAMES[now_dt.weekday()]
+            prompt = f"今は{wd_name}の{time_hint}。{PERSONA_CALL_USER}がしばらく何も話しかけてこない。独り言を一言つぶやいて。"
             result = _call_claude_monologue(prompt)
             text = result.get("reply_text", "")
             emotion = result.get("emotion_tag", "neutral")
