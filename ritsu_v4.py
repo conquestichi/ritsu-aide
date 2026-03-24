@@ -1348,31 +1348,29 @@ class KoganeWatcherThread:
         except Exception as e:
             log.info("Kogane messages fetch error: %s", e)
 
-    def run(self):
-        log.info("KoganeWatcherThread started (url=%s, interval=%ds, messages=%s)",
-                 KOGANE_SNAPSHOT_URL, KOGANE_POLL_INTERVAL_SEC,
-                 KOGANE_MESSAGES_URL or "disabled")
-        msg_counter = 0
+    def run_trades(self):
+        """トレード監視スレッド（5分間隔）。"""
+        log.info("KoganeTradeWatcher started (url=%s, interval=%ds)",
+                 KOGANE_SNAPSHOT_URL, KOGANE_POLL_INTERVAL_SEC)
         while True:
             try:
-                # トレード監視（5分間隔）
                 data = self._fetch_snapshot()
                 if data:
                     self._check_new_trades(data)
             except Exception as e:
-                log.error("KoganeWatcher error: %s", e)
+                log.error("KoganeTradeWatcher error: %s", e)
+            time.sleep(KOGANE_POLL_INTERVAL_SEC)
 
-            # メッセージ監視（KOGANE_MESSAGES_POLL_SEC間隔、sleepをsnapshotと共有）
-            if KOGANE_MESSAGES_URL:
-                polls_per_snapshot = max(1, KOGANE_POLL_INTERVAL_SEC // KOGANE_MESSAGES_POLL_SEC)
-                for _ in range(polls_per_snapshot):
-                    try:
-                        self._check_new_messages()
-                    except Exception as e:
-                        log.info("KoganeWatcher msg error: %s", e)
-                    time.sleep(KOGANE_MESSAGES_POLL_SEC)
-            else:
-                time.sleep(KOGANE_POLL_INTERVAL_SEC)
+    def run_messages(self):
+        """メッセージ監視スレッド（30秒間隔、独立動作）。"""
+        log.info("KoganeMessageWatcher started (url=%s, interval=%ds)",
+                 KOGANE_MESSAGES_URL, KOGANE_MESSAGES_POLL_SEC)
+        while True:
+            try:
+                self._check_new_messages()
+            except Exception as e:
+                log.info("KoganeMessageWatcher error: %s", e)
+            time.sleep(KOGANE_MESSAGES_POLL_SEC)
 
 # ---------------------------------------------------------------------------
 # 10. tkinter GUI
@@ -1501,7 +1499,9 @@ def run_gui():
     # Start Kogane watcher thread
     if KOGANE_ENABLE:
         kogane = KoganeWatcherThread(on_speak=monologue_speak)
-        threading.Thread(target=kogane.run, daemon=True, name="KoganeWatcher").start()
+        threading.Thread(target=kogane.run_trades, daemon=True, name="KoganeTradeWatcher").start()
+        if KOGANE_MESSAGES_URL:
+            threading.Thread(target=kogane.run_messages, daemon=True, name="KoganeMessageWatcher").start()
 
     root.mainloop()
 
