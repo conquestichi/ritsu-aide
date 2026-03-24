@@ -111,7 +111,7 @@ MONOLOGUE_SCHEDULE_TOLERANCE_SEC = env_int("RITSU_MONOLOGUE_SCHEDULE_TOLERANCE_S
 KOGANE_ENABLE = env_int("RITSU_KOGANE_ENABLE", 0)
 KOGANE_SNAPSHOT_URL = env("RITSU_KOGANE_SNAPSHOT_URL", "https://ingaquants.jp/api/kogane-snapshot?mode=demo")
 KOGANE_POLL_INTERVAL_SEC = env_int("RITSU_KOGANE_POLL_INTERVAL_SEC", 300)  # 5分
-KOGANE_TTS_SPEAKER_STYLE_ID = env_int("RITSU_KOGANE_TTS_SPEAKER_STYLE_ID", 6)  # 四国めたん(ツンツン)
+KOGANE_TTS_SPEAKER_STYLE_ID = env_int("RITSU_KOGANE_TTS_SPEAKER_STYLE_ID", 46)  # 小夜/SAYO(ノーマル)
 KOGANE_MESSAGES_URL = env("RITSU_KOGANE_MESSAGES_URL", "")  # https://inga-quants.com/api/kogane-messages
 KOGANE_MESSAGES_POLL_SEC = env_int("RITSU_KOGANE_MESSAGES_POLL_SEC", 30)
 
@@ -759,7 +759,7 @@ def _speak_voicevox(text: str, emotion: str, requests, np, sd, speaker: int | No
 
 def tts_speak(text: str, emotion: str = "neutral", speaker: int | None = None):
     """Enqueue text for TTS playback with emotion-based voice adjustment.
-    speaker: VOICEVOX speaker ID override. None=律(デフォルト), 6=こがね等。
+    speaker: VOICEVOX speaker ID override. None=律(デフォルト), 46=こがね(小夜/SAYO)。
     """
     _tts_queue.put((text, emotion, speaker))
 
