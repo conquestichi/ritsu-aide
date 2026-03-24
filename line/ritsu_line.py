@@ -216,8 +216,15 @@ _RITSU_PERSONA = """あなたは「律（りつ）」。司令官の常駐秘書
 """
 
 
+_WEEKDAY_NAMES_LINE = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+
 def _build_system_prompt(memory_context: str) -> str:
-    parts = [_RITSU_PERSONA]
+    now = datetime.now()
+    wd_name = _WEEKDAY_NAMES_LINE[now.weekday()]
+    date_str = now.strftime("%Y年%m月%d日")
+    time_str = now.strftime("%H:%M")
+    date_header = f"## 現在の日時\n{date_str}（{wd_name}）{time_str}\n\n"
+    parts = [date_header + _RITSU_PERSONA]
     if memory_context:
         parts.append(f"\n## 記憶\n{memory_context}")
     return "\n".join(parts)

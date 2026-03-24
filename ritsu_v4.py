@@ -452,7 +452,14 @@ def handle_memory_command(text: str) -> Optional[str]:
 
 def _build_system_prompt() -> str:
     """Build system prompt with persona + summaries + knowledge."""
+    now = datetime.now()
+    wd_name = _WEEKDAY_NAMES[now.weekday()]
+    date_str = now.strftime("%Y年%m月%d日")
+    time_str = now.strftime("%H:%M")
     base = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AIアシスタントでもある。
+
+## 現在の日時
+{date_str}（{wd_name}）{time_str}
 
 {_PERSONA_FULL}
 
@@ -670,7 +677,15 @@ def _call_claude_monologue(prompt: str) -> dict:
         return {"reply_text": "", "emotion_tag": "neutral"}
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        now = datetime.now()
+        wd_name = _WEEKDAY_NAMES[now.weekday()]
+        date_str = now.strftime("%Y年%m月%d日")
+        time_str = now.strftime("%H:%M")
         system = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
+
+## 現在の日時
+{date_str}（{wd_name}）{time_str}
+
 {_PERSONA_FULL}
 
 ## 独り言ルール
@@ -709,7 +724,15 @@ def _call_claude_kogane_report(trade_info: str) -> dict:
         return {"reply_text": "", "emotion_tag": "neutral"}
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        now = datetime.now()
+        wd_name = _WEEKDAY_NAMES[now.weekday()]
+        date_str = now.strftime("%Y年%m月%d日")
+        time_str = now.strftime("%H:%M")
         system = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
+
+## 現在の日時
+{date_str}（{wd_name}）{time_str}
+
 {_PERSONA_FULL}
 
 ## こがねトレード報告ルール
