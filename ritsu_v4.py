@@ -1296,30 +1296,40 @@ class MonologueThread:
             self._fired_schedule_slots.clear()
 
     def _try_schedule(self):
-        """Schedule型: 定時スロットにClaude APIで独り言生成"""
+        """Schedule型: text→固定再生(API不要) / prompt→Claude API生成"""
         if not MONOLOGUE_SCHEDULE_ENABLE or not self._schedule_slots:
             return
         now = datetime.now()
+        wd = now.weekday()
         tolerance = MONOLOGUE_SCHEDULE_TOLERANCE_SEC
 
         for slot in self._schedule_slots:
             slot_time = slot.get("time", "")
             if slot_time in self._fired_schedule_slots:
                 continue
+            slot_wd = slot.get("weekdays")
+            if slot_wd is not None and wd not in slot_wd:
+                continue
             try:
                 sh, sm = map(int, slot_time.split(":"))
                 slot_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
                 diff = abs((now - slot_dt).total_seconds())
                 if diff <= tolerance:
-                    prompt = slot.get("prompt", "独り言を一言")
-                    wd_name = _WEEKDAY_NAMES[now.weekday()]
-                    prompt = f"今日は{wd_name}。{prompt}"
-                    log.info("Schedule monologue firing: %s", slot_time)
-                    result = _call_claude_monologue(prompt)
-                    text = result.get("reply_text", "")
-                    if text:
-                        self.on_speak(text, result.get("emotion_tag", "neutral"))
-                        self._last_monologue_time = time.time()
+                    fixed_text = slot.get("text")
+                    if fixed_text:
+                        emotion = slot.get("emotion_tag", "neutral")
+                        log.info("Schedule fixed firing: %s", slot_time)
+                        self.on_speak(fixed_text, emotion)
+                    else:
+                        prompt = slot.get("prompt", "独り言を一言")
+                        wd_name = _WEEKDAY_NAMES[wd]
+                        prompt = f"今日は{wd_name}。{prompt}"
+                        log.info("Schedule API firing: %s", slot_time)
+                        result = _call_claude_monologue(prompt)
+                        text = result.get("reply_text", "")
+                        if text:
+                            self.on_speak(text, result.get("emotion_tag", "neutral"))
+                    self._last_monologue_time = time.time()
                     self._fired_schedule_slots.add(slot_time)
             except Exception as e:
                 log.warning("Schedule monologue error for %s: %s", slot_time, e)
