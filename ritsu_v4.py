@@ -120,6 +120,21 @@ SHARED_KNOWLEDGE_URL = env("RITSU_SHARED_KNOWLEDGE_URL", "")  # https://ingaquan
 SHARED_KNOWLEDGE_TOKEN = env("RITSU_SHARED_KNOWLEDGE_TOKEN", "")
 SHARED_KNOWLEDGE_SYNC_SEC = env_int("RITSU_SHARED_KNOWLEDGE_SYNC_SEC", 600)  # 10分
 
+# inga-fact briefing
+FACT_ENABLE = env_int("RITSU_FACT_ENABLE", 0)
+FACT_API_URL = env("RITSU_FACT_API_URL", "http://160.251.167.44:9879/api/fact/today")
+FACT_API_TOKEN = env("RITSU_FACT_API_TOKEN", "")
+
+# inga-fact briefing
+FACT_ENABLE = env_int("RITSU_FACT_ENABLE", 0)
+FACT_API_URL = env("RITSU_FACT_API_URL", "http://160.251.167.44:9879/api/fact/today")
+FACT_API_TOKEN = env("RITSU_FACT_API_TOKEN", "")
+
+# inga-fact briefing
+FACT_ENABLE = env_int("RITSU_FACT_ENABLE", 0)
+FACT_API_URL = env("RITSU_FACT_API_URL", "http://160.251.167.44:9879/api/fact/today")
+FACT_API_TOKEN = env("RITSU_FACT_API_TOKEN", "")
+
 # ---------------------------------------------------------------------------
 # 3. Singleton guard
 # ---------------------------------------------------------------------------
@@ -755,6 +770,210 @@ def _call_claude_kogane_report(trade_info: str) -> dict:
         log.error("Kogane report Claude error: %s", e)
         return {"reply_text": "", "emotion_tag": "neutral"}
 
+
+def _fetch_fact_briefing() -> str | None:
+    """inga-fact APIから定性評価を取得し、律の朝ブリーフィングを生成。"""
+    if not FACT_ENABLE or not FACT_API_URL:
+        return None
+    import requests as req
+    try:
+        headers = {}
+        if FACT_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FACT_API_TOKEN}"
+        resp = req.get(FACT_API_URL, headers=headers, timeout=15)
+        if resp.status_code == 404:
+            log.info("Fact API: no evaluation yet for today")
+            return None
+        if resp.status_code != 200:
+            log.warning("Fact API HTTP %d", resp.status_code)
+            return None
+        data = resp.json()
+    except Exception as e:
+        log.warning("Fact API error: %s", e)
+        return None
+
+    meta = data.get("meta", {})
+    stance = data.get("overall_stance", "unknown")
+    confidence = data.get("confidence", 0)
+    features = data.get("features", {})
+    pre_calc = data.get("pre_calculated", {})
+    threads = data.get("active_threads", [])[:3]
+    events = [e for e in data.get("events_upcoming", []) if e.get("days_until", 99) <= 5]
+    contrarian = data.get("contrarian", {})
+    accuracy = data.get("accuracy_history", {})
+
+    thread_lines = [f"  - {t['theme']}({t['direction']}, 確信度{t['confidence']})" for t in threads]
+    event_lines = [f"  - {e['event']}({e['days_until']}日後, {e['importance']})" for e in events]
+    narrative = features.get("N1", {}).get("value", "不明")
+    sentiment = features.get("N3", {}).get("value", 0)
+
+    summary = (
+        f"日付: {data.get('date')}\n"
+        f"総合判断: {stance}(確信度{confidence})\n"
+        f"支配的ナラティブ: {narrative}\n"
+        f"センチメント: {sentiment}\n"
+        f"ドル円: {pre_calc.get('M3', {}).get('value', '不明')}\n"
+        f"裁定残高: {pre_calc.get('S3', {}).get('value', '不明')}\n"
+        f"出来高: {pre_calc.get('S4', {}).get('value', '不明')}\n"
+    )
+    if thread_lines:
+        summary += "主要スレッド:\n" + "\n".join(thread_lines) + "\n"
+    if event_lines:
+        summary += "直近イベント:\n" + "\n".join(event_lines) + "\n"
+    if contrarian.get("flag"):
+        summary += "逆張りフラグ: 発動中\n"
+    summary += f"直近5日精度: {accuracy.get('last_5_avg', '未集計')}\n"
+    if meta.get("stale"):
+        summary += "注意: データが古い可能性あり\n"
+
+    stale_note = "なお、今朝のデータは古い可能性があるので注意喚起してください。" if meta.get("stale") else ""
+    prompt = (
+        f"以下はinga-factの今朝の市場定性評価です。"
+        f"これを{PERSONA_CALL_USER}への朝ブリーフィングとして、"
+        f"律の口調で簡潔に報告してください（3-5文）。"
+        f"重要なポイントだけ。数値の羅列は不要。{stale_note}\n\n{summary}"
+    )
+    log.info("Fact briefing prompt built, calling Claude...")
+    result = _call_claude_monologue(prompt)
+    return result.get("reply_text")
+
+
+
+def _fetch_fact_briefing() -> str | None:
+    """inga-fact APIから定性評価を取得し、律の朝ブリーフィングを生成。"""
+    if not FACT_ENABLE or not FACT_API_URL:
+        return None
+    import requests as req
+    try:
+        headers = {}
+        if FACT_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FACT_API_TOKEN}"
+        resp = req.get(FACT_API_URL, headers=headers, timeout=15)
+        if resp.status_code == 404:
+            log.info("Fact API: no evaluation yet for today")
+            return None
+        if resp.status_code != 200:
+            log.warning("Fact API HTTP %d", resp.status_code)
+            return None
+        data = resp.json()
+    except Exception as e:
+        log.warning("Fact API error: %s", e)
+        return None
+
+    meta = data.get("meta", {})
+    stance = data.get("overall_stance", "unknown")
+    confidence = data.get("confidence", 0)
+    features = data.get("features", {})
+    pre_calc = data.get("pre_calculated", {})
+    threads = data.get("active_threads", [])[:3]
+    events = [e for e in data.get("events_upcoming", []) if e.get("days_until", 99) <= 5]
+    contrarian = data.get("contrarian", {})
+    accuracy = data.get("accuracy_history", {})
+
+    thread_lines = [f"  - {t['theme']}({t['direction']}, 確信度{t['confidence']})" for t in threads]
+    event_lines = [f"  - {e['event']}({e['days_until']}日後, {e['importance']})" for e in events]
+    narrative = features.get("N1", {}).get("value", "不明")
+    sentiment = features.get("N3", {}).get("value", 0)
+
+    summary = (
+        f"日付: {data.get('date')}\n"
+        f"総合判断: {stance}(確信度{confidence})\n"
+        f"支配的ナラティブ: {narrative}\n"
+        f"センチメント: {sentiment}\n"
+        f"ドル円: {pre_calc.get('M3', {}).get('value', '不明')}\n"
+        f"裁定残高: {pre_calc.get('S3', {}).get('value', '不明')}\n"
+        f"出来高: {pre_calc.get('S4', {}).get('value', '不明')}\n"
+    )
+    if thread_lines:
+        summary += "主要スレッド:\n" + "\n".join(thread_lines) + "\n"
+    if event_lines:
+        summary += "直近イベント:\n" + "\n".join(event_lines) + "\n"
+    if contrarian.get("flag"):
+        summary += "逆張りフラグ: 発動中\n"
+    summary += f"直近5日精度: {accuracy.get('last_5_avg', '未集計')}\n"
+    if meta.get("stale"):
+        summary += "注意: データが古い可能性あり\n"
+
+    stale_note = "なお、今朝のデータは古い可能性があるので注意喚起してください。" if meta.get("stale") else ""
+    prompt = (
+        f"以下はinga-factの今朝の市場定性評価です。"
+        f"これを{PERSONA_CALL_USER}への朝ブリーフィングとして、"
+        f"律の口調で簡潔に報告してください（3-5文）。"
+        f"重要なポイントだけ。数値の羅列は不要。{stale_note}\n\n{summary}"
+    )
+    log.info("Fact briefing prompt built, calling Claude...")
+    result = _call_claude_monologue(prompt)
+    return result.get("reply_text")
+
+
+
+def _fetch_fact_briefing() -> str | None:
+    """inga-fact APIから定性評価を取得し、律の朝ブリーフィングを生成。"""
+    if not FACT_ENABLE or not FACT_API_URL:
+        return None
+    import requests as req
+    try:
+        headers = {}
+        if FACT_API_TOKEN:
+            headers["Authorization"] = f"Bearer {FACT_API_TOKEN}"
+        resp = req.get(FACT_API_URL, headers=headers, timeout=15)
+        if resp.status_code == 404:
+            log.info("Fact API: no evaluation yet for today")
+            return None
+        if resp.status_code != 200:
+            log.warning("Fact API HTTP %d", resp.status_code)
+            return None
+        data = resp.json()
+    except Exception as e:
+        log.warning("Fact API error: %s", e)
+        return None
+
+    meta = data.get("meta", {})
+    stance = data.get("overall_stance", "unknown")
+    confidence = data.get("confidence", 0)
+    features = data.get("features", {})
+    pre_calc = data.get("pre_calculated", {})
+    threads = data.get("active_threads", [])[:3]
+    events = [e for e in data.get("events_upcoming", []) if e.get("days_until", 99) <= 5]
+    contrarian = data.get("contrarian", {})
+    accuracy = data.get("accuracy_history", {})
+
+    thread_lines = [f"  - {t['theme']}({t['direction']}, 確信度{t['confidence']})" for t in threads]
+    event_lines = [f"  - {e['event']}({e['days_until']}日後, {e['importance']})" for e in events]
+    narrative = features.get("N1", {}).get("value", "不明")
+    sentiment = features.get("N3", {}).get("value", 0)
+
+    summary = (
+        f"日付: {data.get('date')}\n"
+        f"総合判断: {stance}(確信度{confidence})\n"
+        f"支配的ナラティブ: {narrative}\n"
+        f"センチメント: {sentiment}\n"
+        f"ドル円: {pre_calc.get('M3', {}).get('value', '不明')}\n"
+        f"裁定残高: {pre_calc.get('S3', {}).get('value', '不明')}\n"
+        f"出来高: {pre_calc.get('S4', {}).get('value', '不明')}\n"
+    )
+    if thread_lines:
+        summary += "主要スレッド:\n" + "\n".join(thread_lines) + "\n"
+    if event_lines:
+        summary += "直近イベント:\n" + "\n".join(event_lines) + "\n"
+    if contrarian.get("flag"):
+        summary += "逆張りフラグ: 発動中\n"
+    summary += f"直近5日精度: {accuracy.get('last_5_avg', '未集計')}\n"
+    if meta.get("stale"):
+        summary += "注意: データが古い可能性あり\n"
+
+    stale_note = "なお、今朝のデータは古い可能性があるので注意喚起してください。" if meta.get("stale") else ""
+    prompt = (
+        f"以下はinga-factの今朝の市場定性評価です。"
+        f"これを{PERSONA_CALL_USER}への朝ブリーフィングとして、"
+        f"律の口調で簡潔に報告してください（3-5文）。"
+        f"重要なポイントだけ。数値の羅列は不要。{stale_note}\n\n{summary}"
+    )
+    log.info("Fact briefing prompt built, calling Claude...")
+    result = _call_claude_monologue(prompt)
+    return result.get("reply_text")
+
+
 # ---------------------------------------------------------------------------
 # 6. VOICEVOX TTS
 # ---------------------------------------------------------------------------
@@ -1322,13 +1541,19 @@ class MonologueThread:
                         self.on_speak(fixed_text, emotion)
                     else:
                         prompt = slot.get("prompt", "独り言を一言")
-                        wd_name = _WEEKDAY_NAMES[wd]
-                        prompt = f"今日は{wd_name}。{prompt}"
-                        log.info("Schedule API firing: %s", slot_time)
-                        result = _call_claude_monologue(prompt)
-                        text = result.get("reply_text", "")
-                        if text:
-                            self.on_speak(text, result.get("emotion_tag", "neutral"))
+                        if prompt == "__FACT_BRIEFING__":
+                            log.info("Schedule FACT briefing firing: %s", slot_time)
+                            fact_text = _fetch_fact_briefing()
+                            if fact_text:
+                                self.on_speak(fact_text, "think")
+                        else:
+                            wd_name = _WEEKDAY_NAMES[wd]
+                            prompt = f"今日は{wd_name}。{prompt}"
+                            log.info("Schedule API firing: %s", slot_time)
+                            result = _call_claude_monologue(prompt)
+                            text = result.get("reply_text", "")
+                            if text:
+                                self.on_speak(text, result.get("emotion_tag", "neutral"))
                     self._last_monologue_time = time.time()
                     self._fired_schedule_slots.add(slot_time)
             except Exception as e:
