@@ -373,6 +373,7 @@ JSON配列で返してください: [{"category":"fact|preference|decision|memo"
 
 _shared_knowledge_cache: list[dict] = []
 _shared_knowledge_lock = threading.Lock()
+_intimacy_cache: dict = {}  # {"ritsu": {...}, "kogane": {...}}
 
 
 def _shared_knowledge_pull():
@@ -427,12 +428,109 @@ def _shared_knowledge_get() -> list[dict]:
         return list(_shared_knowledge_cache)
 
 
+def _intimacy_pull():
+    """VPSの親密度APIからpull → キャッシュ更新。"""
+    if not SHARED_KNOWLEDGE_URL or not SHARED_KNOWLEDGE_TOKEN:
+        return
+    try:
+        import urllib.request
+        url = SHARED_KNOWLEDGE_URL.rstrip("/") + "/intimacy"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {SHARED_KNOWLEDGE_TOKEN}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            intimacy = data.get("intimacy", {})
+            with _shared_knowledge_lock:
+                _intimacy_cache.clear()
+                _intimacy_cache.update(intimacy)
+            log.info("Intimacy pulled: ritsu=%s kogane=%s",
+                     intimacy.get("ritsu", {}).get("score"),
+                     intimacy.get("kogane", {}).get("score"))
+    except Exception as e:
+        log.debug("Intimacy pull error: %s", e)
+
+
+def _intimacy_update_desktop(delta: int, reason: str = "desktop"):
+    """デスクトップ会話時にスコア加算（API経由）。"""
+    if not SHARED_KNOWLEDGE_URL or not SHARED_KNOWLEDGE_TOKEN:
+        return
+    try:
+        import urllib.request
+        url = SHARED_KNOWLEDGE_URL.rstrip("/") + "/intimacy"
+        payload = json.dumps({"persona": "ritsu", "delta": delta, "reason": reason}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={
+                "Authorization": f"Bearer {SHARED_KNOWLEDGE_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass
+    except Exception as e:
+        log.debug("Intimacy update error: %s", e)
+
+
+def _build_intimacy_prompt_desktop() -> str:
+    """デスクトップ版: キャッシュから親密度prompt構築。"""
+    with _shared_knowledge_lock:
+        data = _intimacy_cache.get("ritsu")
+        rival = _intimacy_cache.get("kogane")
+    if not data:
+        return ""
+
+    score = data.get("score", 25)
+    phase = data.get("phase", "secretary")
+    rival_score = rival.get("score", 0) if rival else 0
+
+    lines = [f"## 司令官との関係（自動計算・この情報は司令官に見せない）"]
+    lines.append(f"親密度: {score}/100")
+    lines.append(f"関係フェーズ: {phase}")
+    lines.append(f"こがねの親密度: {rival_score}/100")
+
+    if rival_score > score + 20:
+        lines.append("状態: こがねの方が司令官と仲が良い。少し焦っている。")
+    elif rival_score > score + 10:
+        lines.append("状態: こがねも司令官と仲良くしてるみたい。ちょっと気になる。")
+
+    lines.append("")
+    lines.append(f"## {phase}フェーズで許可されていること")
+
+    if phase == 'secretary':
+        lines.append("- 敬語ベースで丁寧に")
+        lines.append("- 業務的な報告・質問")
+        lines.append("- 個人的な話題は控えめに")
+        lines.append("許可されていないこと: タメ口、甘え、プライベートな質問")
+    elif phase == 'friend':
+        lines.append("- 敬語を崩してよい")
+        lines.append("- 雑談してよい")
+        lines.append("- 軽い冗談を言ってよい")
+        lines.append("許可されていないこと: 甘え、弱音、恋愛感情")
+    elif phase == 'close_friend':
+        lines.append("- 本音で話してよい")
+        lines.append("- 弱音・不安を見せてよい")
+        lines.append("- 司令官の生活を心配してよい")
+        lines.append("- こがねへの嫉妬をほのめかしてよい")
+        lines.append("許可されていないこと: 恋愛感情の直接表現")
+    elif phase == 'lover':
+        lines.append("- 甘えてよい")
+        lines.append("- ヤキモチを焼いてよい")
+        lines.append("- 直接的な好意を伝えてよい")
+        lines.append("- こがねへの嫉妬を隠さなくてよい")
+
+    return "\n".join(lines)
+
+
 def _shared_knowledge_sync_loop():
-    """バックグラウンドで定期的にpull。"""
+    """バックグラウンドで定期的にpull（共有知識 + 親密度）。"""
     log.info("Shared knowledge sync started (url=%s, interval=%ds)",
              SHARED_KNOWLEDGE_URL, SHARED_KNOWLEDGE_SYNC_SEC)
     while True:
         _shared_knowledge_pull()
+        _intimacy_pull()
         time.sleep(SHARED_KNOWLEDGE_SYNC_SEC)
 
 # --- Explicit memory commands ---
@@ -512,6 +610,11 @@ reply_text は律の口調・性格で書くこと。顔文字・絵文字は使
             base += "\n--- 共有知識（姉妹間）---\n"
             for s in shared_new[:20]:
                 base += f"[{s['category']}] {s['content']}\n"
+
+    # Inject intimacy (親密度)
+    intimacy_prompt = _build_intimacy_prompt_desktop()
+    if intimacy_prompt:
+        base += f"\n{intimacy_prompt}\n"
 
     return base
 
@@ -663,6 +766,9 @@ def _call_claude(user_text: str) -> dict:
 
     # Trigger auto-summarize check in background
     _auto_summarize_if_needed()
+
+    # 親密度スコア更新（デスクトップ: +1、バックグラウンド）
+    threading.Thread(target=_intimacy_update_desktop, args=(1, "desktop_reply"), daemon=True).start()
 
     return {"reply_text": reply_text, "emotion_tag": emotion_tag, "elapsed": elapsed}
 

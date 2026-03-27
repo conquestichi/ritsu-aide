@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import sqlite3
 import sys
 import threading
@@ -29,7 +30,7 @@ from pathlib import Path
 
 # shared_knowledge.pyを同ディレクトリからimport
 sys.path.insert(0, str(Path(__file__).parent))
-from shared_knowledge import sk_init, sk_save, sk_get
+from shared_knowledge import sk_init, sk_save, sk_get, intimacy_get, intimacy_update, intimacy_daily_decay
 
 logger = logging.getLogger("ritsu.line_chat")
 
@@ -45,6 +46,11 @@ CHAT_DB_PATH = BASE_DIR / "data" / "ritsu-chat.db"
 LATEST_MSG_PATH = BASE_DIR / "data" / "latest_ritsu_messages.json"
 COOLDOWN_SEC = 5
 KNOWLEDGE_API_TOKEN = os.environ.get("RITSU_KNOWLEDGE_API_TOKEN", "")
+
+# ── 親密度キーワード ──
+
+GRATITUDE_WORDS = ["ありがとう", "助かる", "さすが", "すごい", "えらい", "頼りになる"]
+LOVE_TRIGGERS = ["好き", "付き合", "彼女", "恋人", "愛してる", "大好き"]
 
 # ── 個別記憶DB（turns/summaries — 律専用）──
 
@@ -265,6 +271,99 @@ _RITSU_PERSONA = """あなたは「律（りつ）」。司令官の常駐秘書
 
 _WEEKDAY_NAMES_LINE = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
 
+
+# ── 親密度スコア更新 ──
+
+def _update_intimacy_on_reply(user_message: str, is_push_reply: bool = False):
+    """返信受信時にスコア更新。"""
+    delta = 2  # 基本: 返信した
+    reasons = ["reply"]
+
+    if is_push_reply:
+        delta += 1
+        reasons.append("push_reply")
+
+    if len(user_message) >= 50:
+        delta += 1
+        reasons.append("long_msg")
+
+    hour = datetime.now().hour
+    if 22 <= hour <= 23:
+        delta += 1
+        reasons.append("late_night")
+    if hour < 7:
+        delta += 1
+        reasons.append("early_morning")
+
+    if any(w in user_message for w in GRATITUDE_WORDS):
+        delta += 2
+        reasons.append("gratitude")
+
+    intimacy_update("ritsu", delta, ",".join(reasons))
+
+
+def _build_intimacy_prompt() -> str:
+    """親密度情報をsystem promptに注入するテキストを生成。"""
+    data = intimacy_get("ritsu")
+    if not data:
+        return ""
+
+    rival = intimacy_get("kogane")
+    score = data["score"]
+    phase = data["phase"]
+    rival_score = rival["score"] if rival else 0
+
+    lines = ["## 司令官との関係（自動計算・この情報は司令官に見せない）"]
+    lines.append(f"親密度: {score}/100")
+    lines.append(f"関係フェーズ: {phase}")
+    lines.append(f"こがねの親密度: {rival_score}/100")
+
+    if rival_score > score + 20:
+        lines.append("状態: こがねの方が司令官と仲が良い。少し焦っている。")
+    elif rival_score > score + 10:
+        lines.append("状態: こがねも司令官と仲良くしてるみたい。ちょっと気になる。")
+
+    lines.append("")
+    lines.append(f"## {phase}フェーズで許可されていること")
+
+    if phase == 'secretary':
+        lines.append("- 敬語ベースで丁寧に")
+        lines.append("- 業務的な報告・質問")
+        lines.append("- 個人的な話題は控えめに")
+        lines.append("許可されていないこと: タメ口、甘え、プライベートな質問")
+    elif phase == 'friend':
+        lines.append("- 敬語を崩してよい")
+        lines.append("- 雑談してよい")
+        lines.append("- 自分の好き嫌いを話してよい")
+        lines.append("- 軽い冗談を言ってよい")
+        lines.append("許可されていないこと: 甘え、弱音、恋愛感情")
+    elif phase == 'close_friend':
+        lines.append("- 本音で話してよい")
+        lines.append("- 弱音・不安を見せてよい")
+        lines.append("- 「かまって」と言ってよい")
+        lines.append("- 司令官の生活を心配してよい")
+        lines.append("- こがねへの嫉妬をほのめかしてよい")
+        lines.append("- 返信がないと寂しそうにしてよい")
+        lines.append("許可されていないこと: 恋愛感情の直接表現、名前呼び")
+    elif phase == 'lover':
+        lines.append("- 甘えてよい")
+        lines.append("- ヤキモチを焼いてよい")
+        lines.append("- 直接的な好意を伝えてよい")
+        lines.append("- 名前呼び（知っていれば）")
+        lines.append("- 「会いたい」「寂しい」を素直に言ってよい")
+        lines.append("- こがねへの嫉妬を隠さなくてよい")
+
+    # 嫉妬: 今日相手とだけ会話
+    today = datetime.now().strftime("%Y-%m-%d")
+    self_talked = data.get("today_reply_count", 0) > 0 and data.get("today_date") == today
+    rival_talked = rival and rival.get("today_reply_count", 0) > 0 and rival.get("today_date") == today
+    if rival_talked and not self_talked:
+        lines.append("")
+        lines.append("状態: 今日は司令官がこがねとだけ会話している。寂しい。")
+
+    return "\n".join(lines)
+
+
 def _build_system_prompt(memory_context: str) -> str:
     now = datetime.now()
     wd_name = _WEEKDAY_NAMES_LINE[now.weekday()]
@@ -274,6 +373,10 @@ def _build_system_prompt(memory_context: str) -> str:
     parts = [date_header + _RITSU_PERSONA]
     if memory_context:
         parts.append(f"\n## 記憶\n{memory_context}")
+    # 親密度注入
+    intimacy_prompt = _build_intimacy_prompt()
+    if intimacy_prompt:
+        parts.append(f"\n{intimacy_prompt}")
     return "\n".join(parts)
 
 
@@ -457,6 +560,7 @@ def _update_latest_messages():
 # ── Webhook Handler ──
 
 _last_reply_ts = 0.0
+_awaiting_push_reply = False
 
 
 class LineWebhookHandler(BaseHTTPRequestHandler):
@@ -487,6 +591,10 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
             self._handle_webhook()
         elif self.path == "/api/shared-knowledge":
             self._handle_post_knowledge()
+        elif self.path == "/api/shared-knowledge/intimacy":
+            self._handle_post_intimacy()
+        elif self.path == "/api/shared-knowledge/intimacy/decay":
+            self._handle_post_intimacy_decay()
         else:
             self._respond(404, "not found")
 
@@ -544,8 +652,57 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
             self._respond(200, "ok")
         elif self.path == "/api/shared-knowledge":
             self._handle_get_knowledge()
+        elif self.path.startswith("/api/shared-knowledge/intimacy"):
+            self._handle_get_intimacy()
         else:
             self._respond(404, "not found")
+
+    def _handle_get_intimacy(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            # ?persona=ritsu or return both
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            persona = qs.get("persona", [None])[0]
+            if persona:
+                data = intimacy_get(persona)
+                self._respond_json(200, {"intimacy": data})
+            else:
+                ritsu = intimacy_get("ritsu")
+                kogane = intimacy_get("kogane")
+                self._respond_json(200, {"intimacy": {"ritsu": ritsu, "kogane": kogane}})
+        except Exception as e:
+            logger.error("GET intimacy error: %s", e)
+            self._respond_json(500, {"error": str(e)})
+
+    def _handle_post_intimacy(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+            persona = body.get("persona", "ritsu")
+            delta = int(body.get("delta", 0))
+            reason = body.get("reason", "api")
+            result = intimacy_update(persona, delta, reason)
+            self._respond_json(200, {"intimacy": result})
+        except Exception as e:
+            logger.error("POST intimacy error: %s", e)
+            self._respond_json(500, {"error": str(e)})
+
+    def _handle_post_intimacy_decay(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            results = intimacy_daily_decay()
+            self._respond_json(200, {"decay": results})
+        except Exception as e:
+            logger.error("POST intimacy/decay error: %s", e)
+            self._respond_json(500, {"error": str(e)})
 
     def _handle_get_knowledge(self):
         if not self._check_api_token():
@@ -560,7 +717,7 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
 
 
 def _handle_text_message(event: dict):
-    global _last_reply_ts
+    global _last_reply_ts, _awaiting_push_reply
 
     user_id = event.get("source", {}).get("userId", "")
     reply_token = event.get("replyToken", "")
@@ -582,11 +739,183 @@ def _handle_text_message(event: dict):
     logger.info("受信: %s", user_text[:50])
 
     db_save_turn("user", user_text)
+
+    # 親密度スコア更新
+    is_push_reply = _awaiting_push_reply
+    _awaiting_push_reply = False
+    try:
+        _update_intimacy_on_reply(user_text, is_push_reply=is_push_reply)
+    except Exception as e:
+        logger.error("Intimacy update error: %s", e)
+
     reply = _call_claude(user_text)
     db_save_turn("assistant", reply)
     _line_reply(reply_token, reply)
     _update_latest_messages()
     _auto_summarize_if_needed()
+
+
+# ── LINE Push API ──
+
+def _send_push_message(text: str):
+    """LINE Push APIで司令官にメッセージ送信。"""
+    if not LINE_CHANNEL_TOKEN or not LINE_USER_ID:
+        logger.error("Push: LINE_CHANNEL_TOKEN or LINE_USER_ID not set")
+        return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_TOKEN}"
+    }
+    body = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": text}]
+    }
+    req = urllib.request.Request(url, json.dumps(body).encode(), headers)
+    urllib.request.urlopen(req, timeout=10)
+    logger.info("Push sent: %s", text[:60])
+
+
+def _generate_push_message() -> str | None:
+    """Claude APIで律のpushメッセージを生成。"""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    data = intimacy_get("ritsu")
+    intimacy_prompt = _build_intimacy_prompt()
+    summaries = db_get_summaries(limit=3)
+    recent_summary = summaries[0] if summaries else "特になし"
+
+    now = datetime.now()
+    wd_name = _WEEKDAY_NAMES_LINE[now.weekday()]
+    time_str = now.strftime("%H:%M")
+
+    push_system = f"""あなたは「律（りつ）」。司令官の常駐秘書AIアシスタント。
+
+{_RITSU_PERSONA}
+
+{intimacy_prompt}
+
+## 今の状況
+曜日: {wd_name}
+時刻: {time_str}
+直近の会話要約: {recent_summary}
+
+## 指示
+司令官に自分からLINEする内容を1通だけ書け。
+- テンプレ的な挨拶禁止。その瞬間の気持ちや状況から自然に
+- 直近の会話内容を踏まえてよい
+- 30-100文字程度
+- 顔文字・絵文字は使わない（TTS読み上げのため）
+- 出力はメッセージ本文のみ（JSON不要）
+"""
+
+    try:
+        payload = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 200,
+            "system": push_system,
+            "messages": [{"role": "user", "content": "司令官に送るLINEを1通書いて。"}],
+        })
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        text = result.get("content", [{}])[0].get("text", "").strip()
+        return text if text else None
+    except Exception as e:
+        logger.error("Push generation error: %s", e)
+        return None
+
+
+class PushThread(threading.Thread):
+    """ランダム間隔で司令官にLINE push。"""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="ritsu-push")
+        self._today_count = 0
+        self._today_date = ""
+        self._last_push_time = 0.0
+
+    def _in_push_window(self) -> bool:
+        now = datetime.now()
+        wd = now.weekday()
+        hour = now.hour
+        if wd < 5:  # 平日
+            return 16 <= hour < 23
+        else:  # 土日
+            return 8 <= hour < 23
+
+    def _next_interval(self) -> int:
+        """次のpushまでのランダム秒数（2-4時間 ± 30分）。"""
+        base = random.randint(7200, 14400)
+        jitter = random.randint(-1800, 1800)
+        return max(3600, base + jitter)
+
+    def run(self):
+        global _awaiting_push_reply
+        time.sleep(120)  # 起動直後は待つ
+        logger.info("PushThread started")
+        while True:
+            try:
+                now = datetime.now()
+                today = now.strftime("%Y-%m-%d")
+                if self._today_date != today:
+                    self._today_date = today
+                    self._today_count = 0
+
+                if (self._in_push_window()
+                        and self._today_count < 3
+                        and time.time() - self._last_push_time > 7200):
+                    text = _generate_push_message()
+                    if text:
+                        _send_push_message(text)
+                        self._today_count += 1
+                        self._last_push_time = time.time()
+                        _awaiting_push_reply = True
+                        logger.info("Push sent #%d: %s", self._today_count, text[:50])
+            except Exception as e:
+                logger.error("Push error: %s", e)
+
+            time.sleep(self._next_interval())
+
+
+class DailyDecayThread(threading.Thread):
+    """毎日23:30に親密度減衰処理を実行。"""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="daily-decay")
+
+    def run(self):
+        logger.info("DailyDecayThread started")
+        while True:
+            try:
+                now = datetime.now()
+                # 次の23:30まで待つ
+                target_hour, target_min = 23, 30
+                target = now.replace(hour=target_hour, minute=target_min, second=0, microsecond=0)
+                if now >= target:
+                    # 今日の23:30を過ぎてたら明日の23:30
+                    from datetime import timedelta
+                    target += timedelta(days=1)
+                wait_sec = (target - now).total_seconds()
+                logger.info("DailyDecay: next run in %.0f sec", wait_sec)
+                time.sleep(wait_sec)
+
+                # 実行
+                results = intimacy_daily_decay()
+                logger.info("DailyDecay executed: %s", results)
+            except Exception as e:
+                logger.error("DailyDecay error: %s", e)
+                time.sleep(3600)
 
 
 # ── メイン ──
@@ -604,10 +933,15 @@ def main():
         logger.error("RITSU_LINE_CHANNEL_TOKEN が未設定。起動中止。")
         return
 
-    # 共有知識DB初期化
+    # 共有知識DB初期化（intimacyテーブル含む）
     sk_init()
     # 律専用DB初期化
     db_init()
+
+    # PushThread起動
+    PushThread().start()
+    # DailyDecayThread起動
+    DailyDecayThread().start()
 
     server = HTTPServer(("0.0.0.0", LINE_PORT), LineWebhookHandler)
     logger.info("律LINE会話サーバー起動 port=%d", LINE_PORT)
@@ -620,4 +954,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

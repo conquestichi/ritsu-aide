@@ -27,7 +27,7 @@ def _sk_connect() -> sqlite3.Connection:
 
 
 def sk_init():
-    """共有知識テーブルを初期化。"""
+    """共有知識テーブル + 親密度テーブルを初期化。"""
     SHARED_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = _sk_connect()
     conn.executescript("""
@@ -42,7 +42,26 @@ def sk_init():
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS intimacy (
+            persona TEXT PRIMARY KEY,
+            score INTEGER DEFAULT 25,
+            phase TEXT DEFAULT 'secretary',
+            consecutive_days INTEGER DEFAULT 0,
+            days_in_target_phase INTEGER DEFAULT 0,
+            last_interaction TEXT,
+            last_push_reply INTEGER DEFAULT 0,
+            today_reply_count INTEGER DEFAULT 0,
+            today_delta_sum INTEGER DEFAULT 0,
+            today_date TEXT,
+            consecutive_silent_days INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+        );
     """)
+    # 初期データ（存在しなければ）
+    conn.execute("INSERT OR IGNORE INTO intimacy (persona, score, phase) VALUES ('ritsu', 25, 'secretary')")
+    conn.execute("INSERT OR IGNORE INTO intimacy (persona, score, phase) VALUES ('kogane', 15, 'secretary')")
+    conn.commit()
     conn.close()
     logger.info("Shared knowledge DB initialized: %s", SHARED_DB_PATH)
 
@@ -100,3 +119,174 @@ def sk_deactivate(content_match: str) -> int:
         count = cur.rowcount
         conn.close()
     return count
+
+
+# ── 親密度 CRUD ──
+
+PHASE_THRESHOLDS = {
+    'secretary':    (0, 25),
+    'friend':       (26, 50),
+    'close_friend': (51, 75),
+    'lover':        (76, 100),
+}
+PHASE_ORDER = ['secretary', 'friend', 'close_friend', 'lover']
+DAILY_DELTA_CAP_PLUS = 15
+DAILY_DELTA_CAP_MINUS = -10
+
+
+def intimacy_get(persona: str) -> dict | None:
+    """親密度レコードを取得。"""
+    with _sk_lock:
+        conn = _sk_connect()
+        row = conn.execute(
+            "SELECT persona, score, phase, consecutive_days, days_in_target_phase, "
+            "last_interaction, last_push_reply, today_reply_count, today_delta_sum, "
+            "today_date, consecutive_silent_days FROM intimacy WHERE persona=?",
+            (persona,)).fetchone()
+        conn.close()
+    if not row:
+        return None
+    keys = ["persona", "score", "phase", "consecutive_days", "days_in_target_phase",
+            "last_interaction", "last_push_reply", "today_reply_count", "today_delta_sum",
+            "today_date", "consecutive_silent_days"]
+    return dict(zip(keys, row))
+
+
+def intimacy_update(persona: str, delta: int, reason: str = "") -> dict | None:
+    """親密度スコアを加減算。日次上限チェック + フェーズ遷移判定。"""
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
+
+    with _sk_lock:
+        conn = _sk_connect()
+        row = conn.execute(
+            "SELECT score, phase, today_delta_sum, today_date, days_in_target_phase, "
+            "today_reply_count, consecutive_days, last_interaction, consecutive_silent_days "
+            "FROM intimacy WHERE persona=?",
+            (persona,)).fetchone()
+        if not row:
+            conn.close()
+            return None
+
+        score, phase, today_sum, row_date, days_in_phase, reply_count, consec_days, last_int, silent_days = row
+
+        # 日次リセット
+        if row_date != today:
+            today_sum = 0
+            reply_count = 0
+
+        # 上限チェック
+        if delta > 0:
+            remaining = DAILY_DELTA_CAP_PLUS - today_sum
+            delta = max(0, min(delta, remaining))
+        elif delta < 0:
+            remaining = DAILY_DELTA_CAP_MINUS - today_sum
+            delta = min(0, max(delta, remaining))
+
+        if delta == 0:
+            conn.close()
+            return intimacy_get(persona)
+
+        new_score = max(0, min(100, score + delta))
+        new_sum = today_sum + delta
+        new_reply_count = reply_count + (1 if delta > 0 else 0)
+
+        # フェーズ遷移判定
+        new_phase = phase
+        target_phase = _score_to_phase(new_score)
+        if target_phase != phase:
+            new_days = days_in_phase + 1
+            phase_idx = PHASE_ORDER.index
+            if phase_idx(target_phase) > phase_idx(phase) and new_days >= 3:
+                new_phase = target_phase
+                new_days = 0
+            elif phase_idx(target_phase) < phase_idx(phase) and new_days >= 5:
+                new_phase = target_phase
+                new_days = 0
+        else:
+            new_days = 0  # 同じフェーズ範囲内 → カウントリセット
+
+        now_str = _dt.now().isoformat()
+        conn.execute(
+            "UPDATE intimacy SET score=?, phase=?, today_delta_sum=?, today_date=?, "
+            "today_reply_count=?, days_in_target_phase=?, last_interaction=?, "
+            "consecutive_silent_days=0, updated_at=datetime('now','localtime') "
+            "WHERE persona=?",
+            (new_score, new_phase, new_sum, today, new_reply_count, new_days, now_str, persona))
+        conn.commit()
+        conn.close()
+
+    logger.info("[intimacy] %s: %d→%d (%+d) phase=%s reason=%s",
+                persona, score, new_score, delta, new_phase, reason)
+    return intimacy_get(persona)
+
+
+def intimacy_daily_decay():
+    """日次減衰処理（23:30にcronまたはtimerで実行）。"""
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
+    results = {}
+
+    for persona in ['ritsu', 'kogane']:
+        data = intimacy_get(persona)
+        if not data:
+            continue
+
+        rival = 'kogane' if persona == 'ritsu' else 'ritsu'
+        rival_data = intimacy_get(rival)
+
+        replied_today = data.get('today_reply_count', 0) > 0 and data.get('today_date') == today
+        decay = 0
+
+        if not replied_today:
+            silent = data.get('consecutive_silent_days', 0) + 1
+            if silent >= 7:
+                decay = -5
+            elif silent >= 3:
+                decay = -3
+            else:
+                decay = -1
+            # silent days更新
+            with _sk_lock:
+                conn = _sk_connect()
+                conn.execute("UPDATE intimacy SET consecutive_silent_days=? WHERE persona=?",
+                             (silent, persona))
+                conn.commit()
+                conn.close()
+        else:
+            # 連続会話日ボーナス
+            consec = data.get('consecutive_days', 0) + 1
+            with _sk_lock:
+                conn = _sk_connect()
+                conn.execute("UPDATE intimacy SET consecutive_days=?, consecutive_silent_days=0 WHERE persona=?",
+                             (consec, persona))
+                conn.commit()
+                conn.close()
+            if consec > 1:
+                decay += 1  # 連続日ボーナス
+
+        # 嫉妬減衰: 相手とだけ会話した日
+        if rival_data and not replied_today:
+            rival_replied = rival_data.get('today_reply_count', 0) > 0 and rival_data.get('today_date') == today
+            if rival_replied:
+                decay -= 2
+
+        # 救済: スコア差30以上で低い方にボーナス
+        if rival_data and rival_data['score'] - data['score'] >= 30:
+            decay += 3
+
+        if decay != 0:
+            intimacy_update(persona, decay, "daily_decay")
+
+        results[persona] = decay
+
+    logger.info("[intimacy] daily decay: %s", results)
+    return results
+
+
+def _score_to_phase(score: int) -> str:
+    """スコアから対応フェーズを返す。"""
+    for phase, (lo, hi) in PHASE_THRESHOLDS.items():
+        if lo <= score <= hi:
+            return phase
+    return 'lover' if score > 100 else 'secretary'
