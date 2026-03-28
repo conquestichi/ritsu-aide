@@ -1179,19 +1179,38 @@ def _speak_voicevox(text: str, emotion: str, requests, np, sd, speaker: int | No
     if nch > 1:
         audio = audio.reshape(-1, nch)
 
+    # 末尾に無音パディング追加（ぶつ切り防止）
+    pad_samples = int(sr * 0.15)  # 150ms
+    if nch > 1:
+        silence = np.zeros((pad_samples, nch), dtype=np.float32)
+    else:
+        silence = np.zeros(pad_samples, dtype=np.float32)
+    audio = np.concatenate([audio, silence])
+
     # Play on default device
     sd.play(audio, samplerate=sr)
 
-    # Optionally also play on CABLE device
+    # Optionally also play on CABLE device (separate stream)
     cable_dev = TTS_CABLE_DEVICE
+    cable_stream = None
     if cable_dev:
         try:
             cable_idx = int(cable_dev)
-            sd.play(audio, samplerate=sr, device=cable_idx)
+            cable_stream = sd.OutputStream(samplerate=sr, device=cable_idx,
+                                           channels=nch if nch > 1 else 1,
+                                           dtype='float32')
+            cable_stream.start()
+            cable_stream.write(audio if nch > 1 else audio.reshape(-1, 1))
         except Exception as e:
             log.warning("CABLE device play failed: %s", e)
 
     sd.wait()
+    if cable_stream:
+        try:
+            cable_stream.stop()
+            cable_stream.close()
+        except Exception:
+            pass
 
 def tts_speak(text: str, emotion: str = "neutral", speaker: int | None = None):
     """Enqueue text for TTS playback with emotion-based voice adjustment.
