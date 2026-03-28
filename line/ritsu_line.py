@@ -32,7 +32,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from shared_knowledge import (sk_init, sk_save, sk_get, intimacy_get, intimacy_update,
                                intimacy_daily_decay, intimacy_record_push,
-                               intimacy_rival_pushed_recently, intimacy_get_rival_recent_pushes)
+                               intimacy_rival_pushed_recently, intimacy_get_rival_recent_pushes,
+                               intimacy_set_confession)
 
 logger = logging.getLogger("ritsu.line_chat")
 
@@ -300,6 +301,34 @@ def _update_intimacy_on_reply(user_message: str, is_push_reply: bool = False):
     if any(w in user_message for w in GRATITUDE_WORDS):
         delta += 2
         reasons.append("gratitude")
+
+    # 冷たい返信（5文字以下）
+    if len(user_message) <= 5:
+        delta -= 1
+        reasons.append("cold_msg")
+
+    # ── 隠し条件 ──
+    # 攻殻機動隊ネタ
+    if "ゴースト" in user_message:
+        delta += 1
+        reasons.append("ghost_ref")
+
+    # パパの話題（共感的に）
+    papa_words = ["パパ", "ぱぱ", "お父さん", "父"]
+    papa_negative = ["追及", "なんで", "本当に"]
+    if any(w in user_message for w in papa_words):
+        if any(w in user_message for w in papa_negative):
+            delta -= 2
+            reasons.append("papa_negative")
+        else:
+            delta += 2
+            reasons.append("papa_empathy")
+
+    # 告白検知 → lover遷移フラグ
+    if any(w in user_message for w in LOVE_TRIGGERS):
+        intimacy_set_confession("ritsu")
+        delta += 3
+        reasons.append("confession")
 
     intimacy_update("ritsu", delta, ",".join(reasons))
 

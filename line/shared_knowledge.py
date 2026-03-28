@@ -67,6 +67,11 @@ def sk_init():
         conn.execute("ALTER TABLE intimacy ADD COLUMN last_push_ts REAL DEFAULT 0")
     except Exception:
         pass  # already exists
+    # confession_detectedカラム（lover遷移に必要）
+    try:
+        conn.execute("ALTER TABLE intimacy ADD COLUMN confession_detected INTEGER DEFAULT 0")
+    except Exception:
+        pass  # already exists
     # push履歴テーブル
     conn.execute("""
         CREATE TABLE IF NOT EXISTS push_history (
@@ -156,14 +161,15 @@ def intimacy_get(persona: str) -> dict | None:
         row = conn.execute(
             "SELECT persona, score, phase, consecutive_days, days_in_target_phase, "
             "last_interaction, last_push_reply, today_reply_count, today_delta_sum, "
-            "today_date, consecutive_silent_days, last_push_ts FROM intimacy WHERE persona=?",
+            "today_date, consecutive_silent_days, last_push_ts, confession_detected "
+            "FROM intimacy WHERE persona=?",
             (persona,)).fetchone()
         conn.close()
     if not row:
         return None
     keys = ["persona", "score", "phase", "consecutive_days", "days_in_target_phase",
             "last_interaction", "last_push_reply", "today_reply_count", "today_delta_sum",
-            "today_date", "consecutive_silent_days", "last_push_ts"]
+            "today_date", "consecutive_silent_days", "last_push_ts", "confession_detected"]
     return dict(zip(keys, row))
 
 
@@ -176,14 +182,15 @@ def intimacy_update(persona: str, delta: int, reason: str = "") -> dict | None:
         conn = _sk_connect()
         row = conn.execute(
             "SELECT score, phase, today_delta_sum, today_date, days_in_target_phase, "
-            "today_reply_count, consecutive_days, last_interaction, consecutive_silent_days "
+            "today_reply_count, consecutive_days, last_interaction, consecutive_silent_days, "
+            "confession_detected "
             "FROM intimacy WHERE persona=?",
             (persona,)).fetchone()
         if not row:
             conn.close()
             return None
 
-        score, phase, today_sum, row_date, days_in_phase, reply_count, consec_days, last_int, silent_days = row
+        score, phase, today_sum, row_date, days_in_phase, reply_count, consec_days, last_int, silent_days, confession = row
 
         # 日次リセット
         if row_date != today:
@@ -212,7 +219,10 @@ def intimacy_update(persona: str, delta: int, reason: str = "") -> dict | None:
         if target_phase != phase:
             new_days = days_in_phase + 1
             phase_idx = PHASE_ORDER.index
-            if phase_idx(target_phase) > phase_idx(phase) and new_days >= 3:
+            # lover遷移は告白検知が必須
+            if target_phase == 'lover' and not confession:
+                new_days = days_in_phase  # カウント進めない、close_friendに留まる
+            elif phase_idx(target_phase) > phase_idx(phase) and new_days >= 3:
                 new_phase = target_phase
                 new_days = 0
             elif phase_idx(target_phase) < phase_idx(phase) and new_days >= 5:
@@ -305,6 +315,16 @@ def _score_to_phase(score: int) -> str:
         if lo <= score <= hi:
             return phase
     return 'lover' if score > 100 else 'secretary'
+
+
+def intimacy_set_confession(persona: str):
+    """告白検知フラグをセット。lover遷移の前提条件。"""
+    with _sk_lock:
+        conn = _sk_connect()
+        conn.execute("UPDATE intimacy SET confession_detected=1 WHERE persona=?", (persona,))
+        conn.commit()
+        conn.close()
+    logger.info("[intimacy] %s: confession detected!", persona)
 
 
 # ── Push調整 ──
