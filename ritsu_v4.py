@@ -563,16 +563,12 @@ def handle_memory_command(text: str) -> Optional[str]:
 
 # --- Build dynamic system prompt with memory context ---
 
-def _build_system_prompt() -> str:
-    """Build system prompt with persona + summaries + knowledge."""
-    now = datetime.now()
-    wd_name = _WEEKDAY_NAMES[now.weekday()]
-    date_str = now.strftime("%Y年%m月%d日")
-    time_str = now.strftime("%H:%M")
-    base = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AIアシスタントでもある。
-
-## 現在の日時
-{date_str}（{wd_name}）{time_str}
+def _build_system_prompt() -> list[dict]:
+    """Build system prompt with persona + summaries + knowledge.
+    Returns list format for Prompt Caching support.
+    """
+    # ── 静的部分（キャッシュ対象）──
+    static = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AIアシスタントでもある。
 
 {_PERSONA_FULL}
 
@@ -586,37 +582,47 @@ def _build_system_prompt() -> str:
 emotion_tag は以下から選択: calm, happy, sorry, warn, think, neutral
 reply_text は律の口調・性格で書くこと。顔文字・絵文字は使わない（TTS読み上げのため）。
 """
+
+    # ── 動的部分（毎回変わる）──
+    now = datetime.now()
+    wd_name = _WEEKDAY_NAMES[now.weekday()]
+    date_str = now.strftime("%Y年%m月%d日")
+    time_str = now.strftime("%H:%M")
+    dynamic = f"## 現在の日時\n{date_str}（{wd_name}）{time_str}\n"
+
     # Inject summaries
     summaries = db_get_summaries(3)
     if summaries:
-        base += "\n\n--- 過去の会話要約 ---\n"
+        dynamic += "\n--- 過去の会話要約 ---\n"
         for s in summaries:
-            base += f"・{s}\n"
+            dynamic += f"・{s}\n"
 
     # Inject knowledge (local)
     knowledge = db_get_knowledge(20)
     if knowledge:
-        base += "\n--- 記憶している事実 ---\n"
+        dynamic += "\n--- 記憶している事実 ---\n"
         for k in knowledge:
-            base += f"[{k['category']}] {k['content']}\n"
+            dynamic += f"[{k['category']}] {k['content']}\n"
 
     # Inject shared knowledge (VPS — 律+こがね共有)
     shared = _shared_knowledge_get()
     if shared:
-        # ローカルと重複除去
         local_contents = {k['content'] for k in knowledge} if knowledge else set()
         shared_new = [s for s in shared if s['content'] not in local_contents]
         if shared_new:
-            base += "\n--- 共有知識（姉妹間）---\n"
+            dynamic += "\n--- 共有知識（姉妹間）---\n"
             for s in shared_new[:20]:
-                base += f"[{s['category']}] {s['content']}\n"
+                dynamic += f"[{s['category']}] {s['content']}\n"
 
     # Inject intimacy (親密度)
     intimacy_prompt = _build_intimacy_prompt_desktop()
     if intimacy_prompt:
-        base += f"\n{intimacy_prompt}\n"
+        dynamic += f"\n{intimacy_prompt}\n"
 
-    return base
+    return [
+        {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": dynamic},
+    ]
 
 # ---------------------------------------------------------------------------
 # 5. Persona (constants only — prompt built dynamically)
@@ -802,10 +808,9 @@ def _call_claude_monologue(prompt: str) -> dict:
         wd_name = _WEEKDAY_NAMES[now.weekday()]
         date_str = now.strftime("%Y年%m月%d日")
         time_str = now.strftime("%H:%M")
-        system = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
 
-## 現在の日時
-{date_str}（{wd_name}）{time_str}
+        # 静的部分（キャッシュ対象）
+        static = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
 
 {_PERSONA_FULL}
 
@@ -816,16 +821,23 @@ def _call_claude_monologue(prompt: str) -> dict:
 - 出力は必ず以下のJSONのみ:
   {{"reply_text": "独り言テキスト", "emotion_tag": "calm|happy|sorry|warn|think|neutral"}}
 """
+        # 動的部分
+        dynamic = f"## 現在の日時\n{date_str}（{wd_name}）{time_str}\n"
         summaries = db_get_summaries(2)
         knowledge = db_get_knowledge(10)
         if summaries:
-            system += "\n--- 過去の会話要約 ---\n"
+            dynamic += "\n--- 過去の会話要約 ---\n"
             for s in summaries:
-                system += f"・{s}\n"
+                dynamic += f"・{s}\n"
         if knowledge:
-            system += "\n--- 記憶 ---\n"
+            dynamic += "\n--- 記憶 ---\n"
             for k in knowledge:
-                system += f"[{k['category']}] {k['content']}\n"
+                dynamic += f"[{k['category']}] {k['content']}\n"
+
+        system = [
+            {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dynamic},
+        ]
 
         resp = client.messages.create(
             model=RITSU_MODEL, max_tokens=256, system=system,
@@ -849,10 +861,8 @@ def _call_claude_kogane_report(trade_info: str) -> dict:
         wd_name = _WEEKDAY_NAMES[now.weekday()]
         date_str = now.strftime("%Y年%m月%d日")
         time_str = now.strftime("%H:%M")
-        system = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
 
-## 現在の日時
-{date_str}（{wd_name}）{time_str}
+        static = f"""あなたは「{PERSONA_NAME}」。{PERSONA_CALL_USER}の常駐秘書AI。
 
 {_PERSONA_FULL}
 
@@ -866,6 +876,11 @@ def _call_claude_kogane_report(trade_info: str) -> dict:
 - 出力は必ず以下のJSONのみ:
   {{"reply_text": "報告テキスト", "emotion_tag": "calm|happy|sorry|warn|think|neutral"}}
 """
+        system = [
+            {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": f"## 現在の日時\n{date_str}（{wd_name}）{time_str}\n"},
+        ]
+
         resp = client.messages.create(
             model=RITSU_MODEL, max_tokens=256, system=system,
             messages=[{"role": "user", "content": f"こがねの最新状況を報告して:\n{trade_info}"}],

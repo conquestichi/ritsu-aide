@@ -395,20 +395,28 @@ def _build_intimacy_prompt() -> str:
     return "\n".join(lines)
 
 
-def _build_system_prompt(memory_context: str) -> str:
+def _build_system_prompt(memory_context: str) -> list[dict]:
+    """Returns list format for Prompt Caching."""
     now = datetime.now()
     wd_name = _WEEKDAY_NAMES_LINE[now.weekday()]
     date_str = now.strftime("%Y年%m月%d日")
     time_str = now.strftime("%H:%M")
-    date_header = f"## 現在の日時\n{date_str}（{wd_name}）{time_str}\n\n"
-    parts = [date_header + _RITSU_PERSONA]
+
+    # 静的部分（キャッシュ対象）
+    static = _RITSU_PERSONA
+
+    # 動的部分
+    dynamic = f"## 現在の日時\n{date_str}（{wd_name}）{time_str}\n"
     if memory_context:
-        parts.append(f"\n## 記憶\n{memory_context}")
-    # 親密度注入
+        dynamic += f"\n## 記憶\n{memory_context}"
     intimacy_prompt = _build_intimacy_prompt()
     if intimacy_prompt:
-        parts.append(f"\n{intimacy_prompt}")
-    return "\n".join(parts)
+        dynamic += f"\n{intimacy_prompt}"
+
+    return [
+        {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": dynamic},
+    ]
 
 
 # ── Claude API ──
