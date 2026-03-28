@@ -464,6 +464,7 @@ def _call_claude(user_message: str) -> str:
                 "Content-Type": "application/json",
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
             },
             method="POST",
         )
@@ -545,6 +546,7 @@ def _call_claude_raw(prompt: str, system: str) -> str | None:
                 "Content-Type": "application/json",
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
             },
             method="POST",
         )
@@ -872,6 +874,7 @@ def _generate_push_message() -> str | None:
                 "Content-Type": "application/json",
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
             },
             method="POST",
         )
