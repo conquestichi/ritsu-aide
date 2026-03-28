@@ -54,6 +54,7 @@ def sk_init():
             today_delta_sum INTEGER DEFAULT 0,
             today_date TEXT,
             consecutive_silent_days INTEGER DEFAULT 0,
+            last_push_ts REAL DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now', 'localtime')),
             updated_at TEXT DEFAULT (datetime('now', 'localtime'))
         );
@@ -61,6 +62,20 @@ def sk_init():
     # 初期データ（存在しなければ）
     conn.execute("INSERT OR IGNORE INTO intimacy (persona, score, phase) VALUES ('ritsu', 25, 'secretary')")
     conn.execute("INSERT OR IGNORE INTO intimacy (persona, score, phase) VALUES ('kogane', 15, 'secretary')")
+    # 既存テーブルにlast_push_tsカラムがなければ追加（マイグレーション）
+    try:
+        conn.execute("ALTER TABLE intimacy ADD COLUMN last_push_ts REAL DEFAULT 0")
+    except Exception:
+        pass  # already exists
+    # push履歴テーブル
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS push_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            persona TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            ts REAL NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info("Shared knowledge DB initialized: %s", SHARED_DB_PATH)
@@ -141,14 +156,14 @@ def intimacy_get(persona: str) -> dict | None:
         row = conn.execute(
             "SELECT persona, score, phase, consecutive_days, days_in_target_phase, "
             "last_interaction, last_push_reply, today_reply_count, today_delta_sum, "
-            "today_date, consecutive_silent_days FROM intimacy WHERE persona=?",
+            "today_date, consecutive_silent_days, last_push_ts FROM intimacy WHERE persona=?",
             (persona,)).fetchone()
         conn.close()
     if not row:
         return None
     keys = ["persona", "score", "phase", "consecutive_days", "days_in_target_phase",
             "last_interaction", "last_push_reply", "today_reply_count", "today_delta_sum",
-            "today_date", "consecutive_silent_days"]
+            "today_date", "consecutive_silent_days", "last_push_ts"]
     return dict(zip(keys, row))
 
 
@@ -290,3 +305,57 @@ def _score_to_phase(score: int) -> str:
         if lo <= score <= hi:
             return phase
     return 'lover' if score > 100 else 'secretary'
+
+
+# ── Push調整 ──
+
+def intimacy_record_push(persona: str, message: str = ""):
+    """pushを送った時刻とメッセージを記録。"""
+    import time as _time
+    with _sk_lock:
+        conn = _sk_connect()
+        conn.execute("UPDATE intimacy SET last_push_ts=? WHERE persona=?",
+                     (_time.time(), persona))
+        # push_historyに保存
+        conn.execute(
+            "INSERT INTO push_history (persona, message, ts) VALUES (?,?,?)",
+            (persona, message, _time.time()))
+        # 古い履歴を削除（各ペルソナ最新10件のみ保持）
+        conn.execute(
+            "DELETE FROM push_history WHERE id NOT IN "
+            "(SELECT id FROM push_history WHERE persona=? ORDER BY ts DESC LIMIT 10) "
+            "AND persona=?", (persona, persona))
+        conn.commit()
+        conn.close()
+
+
+def intimacy_rival_pushed_recently(persona: str, within_sec: int = 3600) -> bool:
+    """相手(rival)が直近within_sec秒以内にpushしたか。"""
+    import time as _time
+    rival = 'kogane' if persona == 'ritsu' else 'ritsu'
+    with _sk_lock:
+        conn = _sk_connect()
+        try:
+            row = conn.execute("SELECT last_push_ts FROM intimacy WHERE persona=?",
+                               (rival,)).fetchone()
+        except Exception:
+            row = None
+        conn.close()
+    if not row or not row[0]:
+        return False
+    return (_time.time() - row[0]) < within_sec
+
+
+def intimacy_get_rival_recent_pushes(persona: str, limit: int = 3) -> list[str]:
+    """相手の直近pushメッセージを取得（内容被り防止用）。"""
+    rival = 'kogane' if persona == 'ritsu' else 'ritsu'
+    with _sk_lock:
+        conn = _sk_connect()
+        try:
+            rows = conn.execute(
+                "SELECT message FROM push_history WHERE persona=? ORDER BY ts DESC LIMIT ?",
+                (rival, limit)).fetchall()
+        except Exception:
+            rows = []
+        conn.close()
+    return [r[0] for r in rows if r[0]]

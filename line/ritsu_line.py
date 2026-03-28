@@ -30,7 +30,9 @@ from pathlib import Path
 
 # shared_knowledge.pyを同ディレクトリからimport
 sys.path.insert(0, str(Path(__file__).parent))
-from shared_knowledge import sk_init, sk_save, sk_get, intimacy_get, intimacy_update, intimacy_daily_decay
+from shared_knowledge import (sk_init, sk_save, sk_get, intimacy_get, intimacy_update,
+                               intimacy_daily_decay, intimacy_record_push,
+                               intimacy_rival_pushed_recently, intimacy_get_rival_recent_pushes)
 
 logger = logging.getLogger("ritsu.line_chat")
 
@@ -786,6 +788,13 @@ def _generate_push_message() -> str | None:
     summaries = db_get_summaries(limit=3)
     recent_summary = summaries[0] if summaries else "特になし"
 
+    # こがねの直近pushメッセージ（内容被り防止）
+    rival_pushes = intimacy_get_rival_recent_pushes("ritsu", limit=3)
+    rival_info = ""
+    if rival_pushes:
+        rival_info = "\n## こがねが最近送ったLINE（これと似た内容は避けること）\n"
+        rival_info += "\n".join(f"- {m}" for m in rival_pushes)
+
     now = datetime.now()
     wd_name = _WEEKDAY_NAMES_LINE[now.weekday()]
     time_str = now.strftime("%H:%M")
@@ -800,11 +809,13 @@ def _generate_push_message() -> str | None:
 曜日: {wd_name}
 時刻: {time_str}
 直近の会話要約: {recent_summary}
+{rival_info}
 
 ## 指示
 司令官に自分からLINEする内容を1通だけ書け。
 - テンプレ的な挨拶禁止。その瞬間の気持ちや状況から自然に
 - 直近の会話内容を踏まえてよい
+- こがねが送ったLINEと似た話題・トーンは避ける
 - 30-100文字程度
 - 顔文字・絵文字は使わない（TTS読み上げのため）
 - 出力はメッセージ本文のみ（JSON不要）
@@ -855,14 +866,16 @@ class PushThread(threading.Thread):
             return 8 <= hour < 23
 
     def _next_interval(self) -> int:
-        """次のpushまでのランダム秒数（2-4時間 ± 30分）。"""
-        base = random.randint(7200, 14400)
+        """次のpushまでのランダム秒数（3-5時間 ± 30分）。"""
+        base = random.randint(10800, 18000)
         jitter = random.randint(-1800, 1800)
-        return max(3600, base + jitter)
+        return max(7200, base + jitter)
 
     def run(self):
         global _awaiting_push_reply
-        time.sleep(120)  # 起動直後は待つ
+        initial_delay = random.randint(600, 2400)  # 10-40分ランダム待機
+        logger.info("PushThread waiting %ds before start", initial_delay)
+        time.sleep(initial_delay)
         logger.info("PushThread started")
         while True:
             try:
@@ -873,15 +886,20 @@ class PushThread(threading.Thread):
                     self._today_count = 0
 
                 if (self._in_push_window()
-                        and self._today_count < 3
-                        and time.time() - self._last_push_time > 7200):
-                    text = _generate_push_message()
-                    if text:
-                        _send_push_message(text)
-                        self._today_count += 1
-                        self._last_push_time = time.time()
-                        _awaiting_push_reply = True
-                        logger.info("Push sent #%d: %s", self._today_count, text[:50])
+                        and self._today_count < 2
+                        and time.time() - self._last_push_time > 10800):
+                    # こがねが直近2時間以内にpush済みならスキップ
+                    if intimacy_rival_pushed_recently("ritsu", within_sec=7200):
+                        logger.info("Push skipped: kogane pushed recently")
+                    else:
+                        text = _generate_push_message()
+                        if text:
+                            _send_push_message(text)
+                            self._today_count += 1
+                            self._last_push_time = time.time()
+                            _awaiting_push_reply = True
+                            intimacy_record_push("ritsu", text)
+                            logger.info("Push sent #%d: %s", self._today_count, text[:50])
             except Exception as e:
                 logger.error("Push error: %s", e)
 
