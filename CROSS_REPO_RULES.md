@@ -98,6 +98,8 @@
 | fact | inga-fact | 9879 | 定性分析エンジン |
 | kogane | inga-kogane | 9876,9877 | 自動売買+DEMO |
 | ritsu | ritsu-aide | 9878 | LINE bot |
+| pao | inga-ritsu-pao | — | SNS投稿ボット |
+| stream | inga-stream | — | YouTube生配信（律×こがね） |
 
 ## 重要な設計原則（全リポ共通）
 
