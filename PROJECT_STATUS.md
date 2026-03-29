@@ -9,15 +9,17 @@
 - **inga-fact連携**: 平日06:35朝ブリーフィング（/api/fact/today取得→律が報告）
 
 ## 直近の変更（最新5件）
+- 2026-03-30: streaming_modeフラグ対応 — system_flagsテーブル+API+PushThread停止チェック
+- 2026-03-30: health.json作成（監査マニフェスト）
+- 2026-03-30: push自己履歴参照で重複話題防止 — own_recent_pushes注入
 - 2026-03-28: Prompt Caching — urllib直接呼び出しにanthropic-betaヘッダー追加（コミット 29e50db）
 - 2026-03-28: Prompt Caching — system promptをstatic(cached)+dynamicに分割（コミット 91caded）
-- 2026-03-27: TTS音声ぶつ切り修正 — 末尾150ms無音パディング+CABLE独立OutputStream（コミット 57ed859）
-- 2026-03-27: lover confession gate + hidden scoring conditions（コミット b3b2b07）
-- 2026-03-27: push coordination v2 — 2/day max, 3h min interval, rival content dedup（コミット 9374996）
 
 ## 残タスク
 ### 進行中
-- [ ] push重複話題修正 — 自分のpush履歴をプロンプトに注入（本セッションで実装済み・push待ち）
+- [x] push重複話題修正 — 自分のpush履歴をプロンプトに注入（実装済み・デプロイ済み）
+- [x] streaming_modeフラグ対応（実装済み・デプロイ済み）
+- [x] health.json作成（実装済み・デプロイ済み）
 
 ### 待ち（データ蓄積・外部依存）
 - [ ] Scheduleスロット平日19枠の動作確認
@@ -28,9 +30,8 @@
 - [ ] 親密度Phase 4残タスク: 誕生日ボーナス、姉妹間情報伝達、既読スルー態度変化、相場大負け日慰めボーナス
 - [ ] Tool Use設計・実装（天気/タイマー/株価/こがね確認/スクショVision）
 - [ ] スクリーン覗き見（Claude Vision API）
-- [ ] inga-stream連携（streaming_modeフラグ）
+- [ ] inga-stream連携（streaming_modeフラグ — ritsu_v4.py側のMonologueThread/KoganeWatcherThread対応は未実装）
 - [ ] Lapwing VRM変換完了 → VMagicMirror 2体表示
-- [ ] health.json 作成
 
 ## 注意事項
 - ritsu_v4.pyは1ファイル原則（外部モジュール分割禁止）

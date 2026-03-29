@@ -33,7 +33,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from shared_knowledge import (sk_init, sk_save, sk_get, intimacy_get, intimacy_update,
                                intimacy_daily_decay, intimacy_record_push,
                                intimacy_rival_pushed_recently, intimacy_get_rival_recent_pushes,
-                               intimacy_get_own_recent_pushes, intimacy_set_confession)
+                               intimacy_get_own_recent_pushes, intimacy_set_confession,
+                               system_flag_get, system_flag_set)
 
 logger = logging.getLogger("ritsu.line_chat")
 
@@ -636,6 +637,8 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
             self._handle_post_intimacy()
         elif self.path == "/api/shared-knowledge/intimacy/decay":
             self._handle_post_intimacy_decay()
+        elif self.path == "/api/shared-knowledge/system-flags":
+            self._handle_post_system_flags()
         else:
             self._respond(404, "not found")
 
@@ -695,6 +698,8 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
             self._handle_get_knowledge()
         elif self.path.startswith("/api/shared-knowledge/intimacy"):
             self._handle_get_intimacy()
+        elif self.path.startswith("/api/shared-knowledge/system-flags"):
+            self._handle_get_system_flags()
         else:
             self._respond(404, "not found")
 
@@ -754,6 +759,41 @@ class LineWebhookHandler(BaseHTTPRequestHandler):
             self._respond_json(200, {"knowledge": knowledge})
         except Exception as e:
             logger.error("GET shared-knowledge error: %s", e)
+            self._respond_json(500, {"error": str(e)})
+
+    def _handle_get_system_flags(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            key = qs.get("key", [None])[0]
+            if key:
+                value = system_flag_get(key)
+                self._respond_json(200, {"key": key, "value": value})
+            else:
+                self._respond_json(400, {"error": "key parameter required"})
+        except Exception as e:
+            logger.error("GET system-flags error: %s", e)
+            self._respond_json(500, {"error": str(e)})
+
+    def _handle_post_system_flags(self):
+        if not self._check_api_token():
+            self._respond_json(401, {"error": "unauthorized"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+            key = body.get("key", "")
+            value = body.get("value", "off")
+            if not key:
+                self._respond_json(400, {"error": "key required"})
+                return
+            system_flag_set(key, value)
+            self._respond_json(200, {"key": key, "value": value})
+        except Exception as e:
+            logger.error("POST system-flags error: %s", e)
             self._respond_json(500, {"error": str(e)})
 
 
@@ -937,8 +977,12 @@ class PushThread(threading.Thread):
                 if (self._in_push_window()
                         and self._today_count < 2
                         and time.time() - self._last_push_time > 10800):
+                    # 配信中ならpushスキップ
+                    streaming = system_flag_get("streaming_mode")
+                    if streaming and streaming != "off":
+                        logger.info("Push skipped: streaming_mode=%s", streaming)
                     # こがねが直近2時間以内にpush済みならスキップ
-                    if intimacy_rival_pushed_recently("ritsu", within_sec=7200):
+                    elif intimacy_rival_pushed_recently("ritsu", within_sec=7200):
                         logger.info("Push skipped: kogane pushed recently")
                     else:
                         text = _generate_push_message()

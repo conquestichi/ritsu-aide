@@ -81,6 +81,14 @@ def sk_init():
             ts REAL NOT NULL
         )
     """)
+    # system_flagsテーブル（配信モード等のシステムフラグ）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS system_flags (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT 'off',
+            updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info("Shared knowledge DB initialized: %s", SHARED_DB_PATH)
@@ -393,3 +401,37 @@ def intimacy_get_rival_recent_pushes(persona: str, limit: int = 3) -> list[str]:
             rows = []
         conn.close()
     return [r[0] for r in rows if r[0]]
+
+
+# ── System Flags ──
+
+def system_flag_get(key: str) -> str | None:
+    """システムフラグの値を取得。未設定ならNone。"""
+    with _sk_lock:
+        conn = _sk_connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM system_flags WHERE key=?", (key,)).fetchone()
+        except Exception:
+            row = None
+        conn.close()
+    return row[0] if row else None
+
+
+def system_flag_set(key: str, value: str):
+    """システムフラグを設定（upsert）。"""
+    with _sk_lock:
+        conn = _sk_connect()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS system_flags "
+                         "(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'off', "
+                         "updated_at TEXT DEFAULT (datetime('now', 'localtime')))")
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO system_flags (key, value, updated_at) VALUES (?, ?, datetime('now', 'localtime')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value))
+        conn.commit()
+        conn.close()
+    logger.info("System flag set: %s=%s", key, value)

@@ -1,0 +1,15 @@
+{
+  "service": "ritsu-aide",
+  "version": "v4",
+  "checks": {
+    "ports": [
+      {"port": 9878, "label": "律LINE bot + 共有知識API"}
+    ],
+    "files_fresh": [
+      {"path": "/srv/ritsu-shared/shared_knowledge.sqlite", "max_age_hours": 48, "label": "共有知識DB"}
+    ],
+    "systemd_units": [
+      {"unit": "ritsu-line.service", "label": "律LINE bot"}
+    ]
+  }
+}
