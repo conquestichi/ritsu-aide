@@ -3,6 +3,16 @@
 ## プロジェクト概要
 Windows完結の常駐AIアシスタント。1ファイル構成 (ritsu_v4.py)。
 
+## 関係リポジトリ
+
+| リポ | 短縮名 | 関係 |
+|------|--------|------|
+| inga-kogane | kogane | 共有知識DB共有、姉妹連携・嫉妬システム、KoganeWatcherがsnapshot/messages APIポーリング |
+| inga-quants-hp | hp | 共有知識APIを律LINE botが利用 |
+| inga-fact | fact | 朝ブリーフィング連携（/api/fact/today → 律が報告） |
+| inga-ritsu-pao | pao | 律のX投稿パイプライン |
+| inga-stream | stream | YouTube生配信（streaming_modeフラグ連携予定） |
+
 ## アーキテクチャ
 - **頭脳**: Anthropic Claude API (anthropic SDK)
 - **声**: VOICEVOX TTS (localhost:50021, 四国めたん あまあま style=0)

@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from shared_knowledge import (sk_init, sk_save, sk_get, intimacy_get, intimacy_update,
                                intimacy_daily_decay, intimacy_record_push,
                                intimacy_rival_pushed_recently, intimacy_get_rival_recent_pushes,
-                               intimacy_set_confession)
+                               intimacy_get_own_recent_pushes, intimacy_set_confession)
 
 logger = logging.getLogger("ritsu.line_chat")
 
@@ -834,6 +834,13 @@ def _generate_push_message() -> str | None:
         rival_info = "\n## こがねが最近送ったLINE（これと似た内容は避けること）\n"
         rival_info += "\n".join(f"- {m}" for m in rival_pushes)
 
+    # 自分の直近pushメッセージ（同じ話題の繰り返し防止）
+    own_pushes = intimacy_get_own_recent_pushes("ritsu", limit=5)
+    own_info = ""
+    if own_pushes:
+        own_info = "\n## 律が最近送ったLINE（同じ話題・同じ質問は絶対に繰り返さないこと）\n"
+        own_info += "\n".join(f"- {m}" for m in own_pushes)
+
     now = datetime.now()
     wd_name = _WEEKDAY_NAMES_LINE[now.weekday()]
     time_str = now.strftime("%H:%M")
@@ -849,12 +856,14 @@ def _generate_push_message() -> str | None:
 時刻: {time_str}
 直近の会話要約: {recent_summary}
 {rival_info}
+{own_info}
 
 ## 指示
 司令官に自分からLINEする内容を1通だけ書け。
 - テンプレ的な挨拶禁止。その瞬間の気持ちや状況から自然に
 - 直近の会話内容を踏まえてよい
 - こがねが送ったLINEと似た話題・トーンは避ける
+- 自分が過去に送ったLINEと同じ話題・同じ質問は絶対に繰り返さない
 - 30-100文字程度
 - 顔文字・絵文字は使わない（TTS読み上げのため）
 - 出力はメッセージ本文のみ（JSON不要）

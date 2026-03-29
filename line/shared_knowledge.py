@@ -366,6 +366,20 @@ def intimacy_rival_pushed_recently(persona: str, within_sec: int = 3600) -> bool
     return (_time.time() - row[0]) < within_sec
 
 
+def intimacy_get_own_recent_pushes(persona: str, limit: int = 5) -> list[str]:
+    """自分の直近pushメッセージを取得（同じ話題の繰り返し防止用）。"""
+    with _sk_lock:
+        conn = _sk_connect()
+        try:
+            rows = conn.execute(
+                "SELECT message FROM push_history WHERE persona=? ORDER BY ts DESC LIMIT ?",
+                (persona, limit)).fetchall()
+        except Exception:
+            rows = []
+        conn.close()
+    return [r[0] for r in rows if r[0]]
+
+
 def intimacy_get_rival_recent_pushes(persona: str, limit: int = 3) -> list[str]:
     """相手の直近pushメッセージを取得（内容被り防止用）。"""
     rival = 'kogane' if persona == 'ritsu' else 'ritsu'
