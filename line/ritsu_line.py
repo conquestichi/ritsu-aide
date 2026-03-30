@@ -982,7 +982,7 @@ class PushThread(threading.Thread):
                     if streaming and streaming != "off":
                         logger.info("Push skipped: streaming_mode=%s", streaming)
                     # こがねが直近2時間以内にpush済みならスキップ
-                    elif intimacy_rival_pushed_recently("ritsu", within_sec=7200):
+                    elif intimacy_rival_pushed_recently("ritsu", within_sec=1800):
                         logger.info("Push skipped: kogane pushed recently")
                     else:
                         text = _generate_push_message()
