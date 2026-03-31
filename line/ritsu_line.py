@@ -967,6 +967,7 @@ class PushThread(threading.Thread):
         time.sleep(initial_delay)
         logger.info("PushThread started")
         while True:
+            skip_retry = False
             try:
                 now = datetime.now()
                 today = now.strftime("%Y-%m-%d")
@@ -981,9 +982,11 @@ class PushThread(threading.Thread):
                     streaming = system_flag_get("streaming_mode")
                     if streaming and streaming != "off":
                         logger.info("Push skipped: streaming_mode=%s", streaming)
-                    # こがねが直近2時間以内にpush済みならスキップ
+                        skip_retry = True
+                    # こがねが直近30分以内にpush済みならスキップ→短時間リトライ
                     elif intimacy_rival_pushed_recently("ritsu", within_sec=1800):
                         logger.info("Push skipped: kogane pushed recently")
+                        skip_retry = True
                     else:
                         text = _generate_push_message()
                         if text:
@@ -993,10 +996,17 @@ class PushThread(threading.Thread):
                             _awaiting_push_reply = True
                             intimacy_record_push("ritsu", text)
                             logger.info("Push sent #%d: %s", self._today_count, text[:50])
+                        else:
+                            logger.warning("Push generation returned None")
             except Exception as e:
                 logger.error("Push error: %s", e)
 
-            time.sleep(self._next_interval())
+            if skip_retry:
+                retry = random.randint(1200, 2400)  # 20-40分後にリトライ
+                logger.info("Push retry in %ds", retry)
+                time.sleep(retry)
+            else:
+                time.sleep(self._next_interval())
 
 
 class DailyDecayThread(threading.Thread):
