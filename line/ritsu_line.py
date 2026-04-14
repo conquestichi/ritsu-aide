@@ -1011,6 +1011,14 @@ class PushThread(threading.Thread):
                             self._last_push_time = time.time()
                             _awaiting_push_reply = True
                             intimacy_record_push("ritsu", text)
+                            # pushを会話履歴に記録
+                            # これをしないと司令官がpushに返信した時、
+                            # 律は自分が何を言ったか分からず文脈が断絶する
+                            try:
+                                db_save_turn("assistant", text)
+                                _update_latest_messages()
+                            except Exception as e:
+                                logger.error("Push turn save error: %s", e)
                             logger.info("Push sent #%d: %s", self._today_count, text[:50])
                         else:
                             logger.warning("Push generation returned None")
