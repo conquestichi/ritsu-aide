@@ -374,6 +374,7 @@ JSON配列で返してください: [{"category":"fact|preference|decision|memo"
 _shared_knowledge_cache: list[dict] = []
 _shared_knowledge_lock = threading.Lock()
 _intimacy_cache: dict = {}  # {"ritsu": {...}, "kogane": {...}}
+_streaming_mode_cache: dict = {"value": "off", "ts": 0.0}  # 配信モード (off/scene_a/scene_b)
 
 
 def _shared_knowledge_pull():
@@ -472,6 +473,53 @@ def _intimacy_update_desktop(delta: int, reason: str = "desktop"):
             pass
     except Exception as e:
         log.debug("Intimacy update error: %s", e)
+
+
+def _streaming_mode_pull():
+    """VPS共有知識DBからstreaming_modeフラグをpull。
+
+    inga-streamのstream_engine.py が配信開始/終了時に
+    POST /api/shared-knowledge/system-flags で書き込む値を取得する。
+    配信中はMonologue/KoganeWatcherなど律デスクトップの発話系を止める。
+    """
+    if not SHARED_KNOWLEDGE_URL or not SHARED_KNOWLEDGE_TOKEN:
+        return
+    try:
+        import urllib.request
+        url = SHARED_KNOWLEDGE_URL.rstrip("/") + "/system-flags?key=streaming_mode"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {SHARED_KNOWLEDGE_TOKEN}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            value = data.get("value") or "off"
+            with _shared_knowledge_lock:
+                prev = _streaming_mode_cache.get("value", "off")
+                _streaming_mode_cache["value"] = value
+                _streaming_mode_cache["ts"] = time.time()
+            if value != prev:
+                log.info("streaming_mode changed: %s → %s", prev, value)
+    except Exception as e:
+        log.debug("streaming_mode pull error: %s", e)
+
+
+def _is_streaming() -> bool:
+    """現在配信中か。キャッシュ参照（off以外ならTrue）。"""
+    with _shared_knowledge_lock:
+        return _streaming_mode_cache.get("value", "off") != "off"
+
+
+def _streaming_mode_sync_loop():
+    """streaming_modeを短い間隔でpullする専用ループ。
+
+    共有知識本体は10分間隔でもよいが、配信は突発開始されるため
+    配信系との連動は30秒程度で追従する必要がある。
+    """
+    log.info("Streaming mode sync started (interval=30s)")
+    while True:
+        _streaming_mode_pull()
+        time.sleep(30)
 
 
 def _build_intimacy_prompt_desktop() -> str:
@@ -1658,6 +1706,8 @@ class MonologueThread:
         """Schedule型: text→固定再生(API不要) / prompt→Claude API生成"""
         if not MONOLOGUE_SCHEDULE_ENABLE or not self._schedule_slots:
             return
+        if _is_streaming():
+            return  # 配信中はスケジュール独り言停止
         now = datetime.now()
         wd = now.weekday()
         tolerance = MONOLOGUE_SCHEDULE_TOLERANCE_SEC
@@ -1703,6 +1753,8 @@ class MonologueThread:
         """Idle型: 無操作検知 → 70%ストック / 30%API"""
         if not MONOLOGUE_ENABLE:
             return
+        if _is_streaming():
+            return  # 配信中はidle独り言停止
         if not self._in_time_range():
             return
         if self._idle_count_today >= MONOLOGUE_MAX_PER_DAY:
@@ -1784,6 +1836,16 @@ class KoganeWatcherThread:
         return None
 
     def _check_new_trades(self, data: dict):
+        if _is_streaming():
+            # 配信中は律の報告を停止（配信Bでは配信側が担当）
+            # ただしseen_tradesは進めないと配信終了後にまとめて連投される。
+            # seen更新だけして発話は抑制する。
+            trades = data.get("recent_trades", [])
+            for t in trades:
+                key = f"{t.get('ticker', '')}:{t.get('date', '')}"
+                self._seen_trades.add(key)
+            self._initialized = True
+            return
         trades = data.get("recent_trades", [])
         if not trades:
             return
@@ -1836,6 +1898,20 @@ class KoganeWatcherThread:
     def _check_new_messages(self):
         """こがねLINE会話の新着発言を検知 → こがねの声でTTS再生。"""
         if not KOGANE_MESSAGES_URL:
+            return
+        if _is_streaming():
+            # 配信中はこがねLINE発言のTTS抑制（配信側で別途しゃべる）
+            # last_tsだけ最新に進めて終了後の連投を防ぐ
+            import requests as req
+            try:
+                resp = req.get(KOGANE_MESSAGES_URL, timeout=10)
+                if resp.status_code == 200:
+                    messages = resp.json().get("messages", [])
+                    if messages:
+                        self._last_msg_ts = messages[-1].get("ts", self._last_msg_ts)
+                        self._msg_initialized = True
+            except Exception:
+                pass
             return
         import requests as req
         try:
@@ -2030,7 +2106,9 @@ def run_gui():
     # Start shared knowledge sync
     if SHARED_KNOWLEDGE_URL and SHARED_KNOWLEDGE_TOKEN:
         _shared_knowledge_pull()  # 初回即pull
+        _streaming_mode_pull()    # 初回即pull
         threading.Thread(target=_shared_knowledge_sync_loop, daemon=True, name="SharedKnowledgeSync").start()
+        threading.Thread(target=_streaming_mode_sync_loop, daemon=True, name="StreamingModeSync").start()
 
     root.mainloop()
 
